@@ -35,6 +35,7 @@ import {
   getCodecState,
 } from "../codec.ts";
 import { connectChannel, openChannel, registerRelease } from "../channel.ts";
+import { RefQueue } from "../task-queue.ts";
 import { createRpcProxy, makeRpcHandler } from "../rpc.ts";
 
 /** The single method name on the owner-side API surface. */
@@ -107,10 +108,14 @@ function encode(fn: AnyFunction, ctx: EncodeContext): unknown {
     { [CALL]: fn as (...args: never[]) => unknown },
     ctx.registry,
   );
+  // Per-callback serial queue: calls on this callback execute strictly one at
+  // a time (actor semantics); the callback body may suspend with actorYield().
+  const queue = new RefQueue();
   channel.onMessage((message) => {
     const frame = message as CallbackFrame;
     if (frame.type === "call") {
-      void handler(frame).then((res) => {
+      queue.enqueue(async () => {
+        const res = await handler(frame);
         if (res.ok) {
           channel.send(
             {
