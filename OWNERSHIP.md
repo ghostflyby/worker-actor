@@ -82,15 +82,26 @@ accidental leak bounded:
   safety net — under the conditional-strong model the object is not collectable
   while the relationship is active, so the tombstone only fires after release
   already happened or a hold failed.
-- **Holder keepalive**: each holder heartbeats its channels; the owner times out
-  channels with no heartbeat and releases them. This deterministically covers a
-  holder worker dying (its heartbeat stops) — the most invisible leak path
-  (MessagePort has no close event).
+- **Worker-level liveness**: one channel per (owner, holder worker) PAIR — not
+  per reference. The owner PULLS liveness (pings on a cadence; the holder
+  replies pong). A holder whose pongs stop past the timeout is dead: the owner
+  releases ALL of that holder's refs in a single batch and posts ONE
+  `__holder-dead` notice to the main thread (a worker-level monitor, not a
+  per-reference broadcast). Live holders of the same refs are unaffected —
+  per-holder cleanup. This deterministically covers a holder worker dying — the
+  most invisible leak path (MessagePort has no close event). The reverse
+  direction is covered too: a holder whose pings stop fails its refs of that
+  owner, so calls never hang against a dead owner.
 - **Known limitation**: a consumer dropping a ref whose finalizer never runs
-  (FinalizationRegistry is best-effort) leaves the holder channel open and the
-  object retained until the owner-side timeout sweep (keepalive) or actor death.
-  The timeout bounds this; exact reclamation requires explicit `ref.dispose()`
-  (deterministic) or reference counting (not provided).
+  (FinalizationRegistry is best-effort) while its worker stays alive leaves the
+  holder channel open and the object retained until the holder's ref is released
+  or the actor dies. Liveness cannot see this — the worker is alive and pongs
+  normally (a live worker with a dead proxy looks healthy). Exact reclamation
+  requires explicit `ref.dispose()` (deterministic) or reference counting (not
+  provided). Liveness also cannot distinguish "worker blocked" (synchronous
+  deadlock / debugger pause) from "worker dead": a blocked worker stops ponging
+  and its refs are released after the timeout — a bounded over-release, the
+  price of bounded leak recovery.
 
 ## Release paths
 

@@ -62,10 +62,29 @@ export type Frame =
   | { type: "__worker-id"; id: string }
   /** Worker → main: request a channel to the owner of a reference (refId embeds the owner id). */
   | { type: "__acquire-ref"; refId: string }
-  /** Main → owner: serve this reference's object over the given fresh port (per-holder channel). */
-  | { type: "__serve-ref"; refId: string; port: MessagePort }
-  /** Main → requester: here is the acquired channel; materialize the proxy. */
-  | { type: "__ref-acquired"; refId: string; port: MessagePort };
+  /** Main → owner: serve this reference's object over the given fresh port (per-holder channel).
+   *  holderId is the requester's worker id (for per-holder liveness); livenessPort is the
+   *  owner end of the one liveness channel per (owner, holder) pair, sent on the first serve only. */
+  | {
+    type: "__serve-ref";
+    refId: string;
+    port: MessagePort;
+    holderId?: string;
+    livenessPort?: MessagePort;
+  }
+  /** Main → requester: here is the acquired channel; materialize the proxy.
+   *  ownerId is the owner's worker id; livenessPort is the requester end of the pair
+   *  liveness channel (first acquire only). */
+  | {
+    type: "__ref-acquired";
+    refId: string;
+    port: MessagePort;
+    ownerId?: string;
+    livenessPort?: MessagePort;
+  }
+  /** Owner → main: one death notice per holder worker that timed out (liveness sweep);
+   *  refId carries the holder's worker id. The refs are released in a single batch. */
+  | { type: "__holder-dead"; refId: string };
 
 /** Built-in Error constructors whose instances structured-clone natively (identity preserved). */
 const NATIVE_ERROR_CONSTRUCTORS = new Set<ErrorConstructor>([

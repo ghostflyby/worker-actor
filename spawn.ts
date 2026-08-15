@@ -15,7 +15,11 @@ import { ActorDiedError, Frame, PROTOCOL_VERSION } from "./core/protocol.ts";
 import { type Codec, PayloadCodecRegistry } from "./core/codec.ts";
 import { createRpcProxy } from "./core/rpc.ts";
 import type { TransformCallbacks } from "./core/type-utils.ts";
-import { dispatchControlFrame, setMainAcquire } from "./core/worker-context.ts";
+import {
+  type ControlFrame,
+  dispatchControlFrame,
+  setMainAcquire,
+} from "./core/worker-context.ts";
 import { iterableCodec } from "./core/codecs/iterable.ts";
 import { errorCodec } from "./core/codecs/error.ts";
 import { abortSignalCodec } from "./core/codecs/abort_signal.ts";
@@ -94,22 +98,56 @@ const HANDSHAKE_TIMEOUT = 10_000;
 // a worker (a __acquire-ref frame arrived from it) or the main thread itself.
 let nextWorkerId = 1;
 const workersById = new Map<string, Worker>();
+// Reverse lookup for acquire routing: the requester is a Worker; its id is the
+// holder identity for the liveness plane (one channel per owner↔holder pair).
+const workerIdByWorker = new Map<Worker, string>();
+// Established (owner, holder) pairs: the liveness channel is created once per
+// pair, on the first serve; later serves reuse it on both sides.
+const livenessPairs = new Set<string>();
 
 function routeAcquire(refId: string, requester: Worker): void {
   // refId format: "<ownerWorkerId>:<localCount>"
   const ownerId = refId.slice(0, refId.indexOf(":"));
   const owner = workersById.get(ownerId);
   if (!owner) return; // unknown or dead owner: nothing to bootstrap
+  const requesterId = workerIdByWorker.get(requester);
   const { port1, port2 } = new MessageChannel();
+  const transfer1: Transferable[] = [port1];
+  const transfer2: Transferable[] = [port2];
+  // Liveness plane: the owner pulls heartbeats over one channel per worker pair,
+  // so a dead holder is detected once and its refs are released in a batch.
+  let livenessPort1: MessagePort | undefined;
+  let livenessPort2: MessagePort | undefined;
+  const pairKey = requesterId === undefined
+    ? undefined
+    : `${ownerId}:${requesterId}`;
+  if (pairKey !== undefined && !livenessPairs.has(pairKey)) {
+    livenessPairs.add(pairKey);
+    const lc = new MessageChannel();
+    livenessPort1 = lc.port1;
+    livenessPort2 = lc.port2;
+    transfer1.push(lc.port1);
+    transfer2.push(lc.port2);
+  }
   owner.postMessage(
-    { type: "__serve-ref", refId, port: port1 } satisfies Frame,
     {
-      transfer: [port1],
-    },
+      type: "__serve-ref",
+      refId,
+      port: port1,
+      holderId: requesterId,
+      livenessPort: livenessPort1,
+    } satisfies Frame,
+    { transfer: transfer1 },
   );
   requester.postMessage(
-    { type: "__ref-acquired", refId, port: port2 } satisfies Frame,
-    { transfer: [port2] },
+    {
+      type: "__ref-acquired",
+      refId,
+      port: port2,
+      ownerId,
+      livenessPort: livenessPort2,
+    } satisfies Frame,
+    { transfer: transfer2 },
   );
 }
 
@@ -247,6 +285,7 @@ export async function spawn<T>(
   // user request.
   const workerId = `w${nextWorkerId++}`;
   workersById.set(workerId, worker);
+  workerIdByWorker.set(worker, workerId);
   let dead = false;
   let resolveHandshake: (() => void) | undefined;
   let rejectHandshake: ((reason: unknown) => void) | undefined;
@@ -297,7 +336,11 @@ export async function spawn<T>(
       // A worker requests a channel to the owner of a reference; this worker
       // is the requester.
       routeAcquire(frame.refId, worker);
+      return;
     }
+    // Remaining worker→main control frames (e.g. __holder-dead death notices
+    // from the liveness sweep) go to registered codec control handlers.
+    dispatchControlFrame(frame as ControlFrame);
   };
 
   worker.onerror = (ev) =>
@@ -320,6 +363,7 @@ export async function spawn<T>(
     worker.terminate();
     // A dead worker can no longer serve references: drop it from acquire routing.
     workersById.delete(workerId);
+    workerIdByWorker.delete(worker);
     // Notify the owner (e.g. an actor pool) so it can remove/replace the member.
     // Deliberately NOT fired by dispose(): a deliberate shutdown is not a death.
     options.onDeath?.(reason);

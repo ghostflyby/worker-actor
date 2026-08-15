@@ -3,12 +3,12 @@ import { serveWorker } from "../../mod.ts";
 import {
   isRemoteRef,
   ownerChannelCountFor,
+  ownerStrongRefCount,
   releaseRef,
   type RemoteRef,
   remoteRef,
   remoteRefCodec,
-  ownerStrongRefCount,
-  setKeepaliveParams,
+  setLivenessParams,
 } from "./ref_codec.ts";
 
 /** How many real objects were released via [Symbol.dispose] — observable probe. */
@@ -85,9 +85,9 @@ export const rpc = {
   strongRefCount(): number {
     return ownerStrongRefCount();
   },
-  /** Configure keepalive params (test hook). */
-  setKeepalive(intervalMs: number, timeoutMs: number): string {
-    setKeepaliveParams(intervalMs, timeoutMs);
+  /** Configure liveness params (test hook). */
+  setLiveness(intervalMs: number, timeoutMs: number): string {
+    setLivenessParams(intervalMs, timeoutMs);
     return "set";
   },
   sharedCounter(): RemoteRef<Counter> {
@@ -104,6 +104,10 @@ export const rpc = {
   /** Probe: owner-side channels for `shared` (closed on restore). */
   sharedOwnerChannels(): number {
     return ownerChannelCountFor(shared);
+  },
+  /** Probe: owner-side channels serving the named object (main + holders). */
+  holderChannelsFor(name: string): number {
+    return ownerChannelCountFor(namedObjects.get(name)!);
   },
   /** Hold a reference (proxy or fresh) so it can be handed off or called later. */
   holdRef(ref: RemoteRef<unknown>): string {

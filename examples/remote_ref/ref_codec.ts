@@ -8,23 +8,34 @@
  * Identity and transfer (the "reference" semantics):
  *   - Every real object gets a stable refId (registered on the owner side).
  *     Multiple remoteRef(x) of the same object reuse that identity.
- *   - Handing a reference over is a MOVE: the underlying channel port is
- *     transferred to the new holder, so the reference stays single-hop direct
- *     through any number of hand-offs (A → B → C → ... keeps a direct channel
- *     to the owner; no proxy chains). The previous holder's proxy becomes dead.
+ *   - Handing a reference over is SHARING, not moving: a proxy encodes as a
+ *     refId-only token, the receiver keeps its own proxy, and the new holder
+ *     acquires a fresh per-holder channel to the owner on first use (bootstrapped
+ *     by the main thread). Any number of holders share the same identity, each
+ *     with its own direct channel to the owner (A → B → C keeps direct channels;
+ *     no proxy chains).
  *   - A reference that travels back to its owner is RESTORED: the owner's
  *     registry recognizes the refId, collapses it into a local call-through
- *     reference, and the channel is closed — the owner calls the real object
- *     directly, with zero indirection.
+ *     reference, and the arriving channel is closed — the owner calls the real
+ *     object directly, with zero indirection. Other holders' channels stay open.
  *   - Only the owner can produce fresh references (remoteRef of an object it
- *     owns); a proxy holder can only move it. Ownership of the real object is
- *     unaffected by hand-offs — it stays where it was created.
+ *     owns); a proxy holder can only re-encode the refId. Ownership of the real
+ *     object is unaffected by hand-offs — it stays where it was created.
  *
  * Wire protocol (one channel per reference):
  *   proxy → owner  { type: "call"; id; method; args }         // args go through the registry
  *   owner → proxy  { type: "result"; id; ok: true; value }    // value too (nested streams/refs work)
  *   owner → proxy  { type: "result"; id; ok: false; error }
  *   proxy → owner  { type: "dispose" }                        // explicit dispose or GC
+ *
+ * Liveness plane (one channel per owner↔holder WORKER pair, not per reference):
+ *   owner → holder { type: "ping" }                           // the owner PULLS liveness
+ *   holder → owner { type: "pong" }
+ * A holder that stops ponging past the timeout is dead: the owner releases all
+ * of that holder's refs in one batch and posts a single __holder-dead notice to
+ * the main thread. A holder whose pings stop fails its refs of that owner
+ * (reverse detection). Frames below ride on the ref channel; liveness frames
+ * ride on the pair channel.
  *
  * Lifecycle: explicit dispose(), GC-based release (FinalizationRegistry), and
  * failAll (the registry closes the channel). The owner runs the real object's
@@ -45,11 +56,16 @@ import {
   registerRelease,
 } from "../../core/channel.ts";
 import {
+  type ControlFrame,
   getActiveRegistry,
   registerControlHandler,
   triggerAcquire,
 } from "../../core/worker-context.ts";
 import { RemoteError, serializeError } from "../../core/protocol.ts";
+
+// Deno types `self` as Window; in a worker it is a DedicatedWorkerGlobalScope.
+// Only postMessage is used here (the liveness death notice goes to main).
+declare const self: { postMessage(message: unknown): void };
 
 const REF_BRAND = Symbol.for("worker-actor-example.remote-ref");
 /** Marks the receiving-side proxy; lets a peer detect "this is a reference, not a value". */
@@ -100,40 +116,139 @@ let workerIdPrefix = Math.random().toString(36).slice(2);
 const refIdByObj = new WeakMap<object, string>();
 const objByRefId = new Map<string, WeakRef<object>>();
 const ownerChannelsByRefId = new Map<string, Set<Channel>>();
-// Strong hold while at least one holder channel is open: the referenced object
-// stays alive during holder use and becomes collectable once ALL channels
+// Owner-side strong hold while at least one holder channel is open: the referenced
+// object stays alive during holder use and becomes collectable once ALL channels
 // close (holders released). Without this, an object only referenced through
 // refs (WeakMap + WeakRef) could be collected while holders still call it.
 const ownerStrongRefs = new Map<string, object>();
-// Owner-side liveness: last keepalive seen per holder channel; a channel with
-// no heartbeat past the timeout is a zombie (its holder worker died) and is
-// released. Defaults suit production; tests shorten them via rpc.
-let keepaliveIntervalMs = 2_000;
-let keepaliveTimeoutMs = 6_000;
-const channelLastSeen = new Map<Channel, number>();
-const channelRefId = new Map<Channel, string>();
-let keepaliveScanner: ReturnType<typeof setInterval> | undefined;
+// Liveness plane: one channel per (owner, holder worker) pair, independent of
+// refs. The owner PULLS liveness (pings on a cadence); the holder replies pong.
+// A missing pong past the timeout means the holder worker died — the owner
+// releases ALL of that holder's refs in one batch and posts ONE __holder-dead
+// notice to the main thread (a worker-level monitor). The holder in turn
+// watches for missing pings and fails its refs of that owner (reverse
+// detection: a dead owner must not leave the holder's calls hanging forever).
+// Defaults suit production; tests shorten them via rpc.
+let livenessIntervalMs = 2_000;
+let livenessTimeoutMs = 6_000;
 
-/** Configure keepalive (interval / timeout) — test hook; defaults are production-safe. */
-export function setKeepaliveParams(
-  intervalMs: number,
-  timeoutMs: number,
-): void {
-  keepaliveIntervalMs = intervalMs;
-  keepaliveTimeoutMs = timeoutMs;
+/** Configure liveness (ping interval / timeout) — test hook; defaults are production-safe. */
+export function setLivenessParams(intervalMs: number, timeoutMs: number): void {
+  livenessIntervalMs = intervalMs;
+  livenessTimeoutMs = timeoutMs;
 }
 
-function ensureKeepaliveScanner(): void {
-  if (keepaliveScanner) return;
-  keepaliveScanner = setInterval(() => {
+// Owner side: pair channels keyed by holder worker id; ref channels record
+// which holder they belong to (so a dead holder is released in one batch).
+const channelRefId = new Map<Channel, string>();
+const pairByHolderId = new Map<
+  string,
+  { channel: Channel; lastPong: number }
+>();
+const channelHolderId = new Map<Channel, string>();
+let ownerScanner: ReturnType<typeof setInterval> | undefined;
+
+// Holder side: pair channels keyed by owner id; each carries the kill switches
+// of the proxies it covers, fired together when the owner dies.
+interface HolderPair {
+  channel: Channel;
+  lastPing: number;
+  kills: Set<() => void>;
+}
+const pairByOwnerId = new Map<string, HolderPair>();
+let holderScanner: ReturnType<typeof setInterval> | undefined;
+
+/** Owner side of the liveness plane: one pair channel per holder worker (first serve only). */
+function ensureOwnerPair(
+  holderId: string | undefined,
+  livenessPort: MessagePort | undefined,
+): void {
+  if (holderId === undefined || livenessPort === undefined) return;
+  if (pairByHolderId.has(holderId)) {
+    livenessPort.close();
+    return;
+  }
+  const channel = connectChannel(livenessPort);
+  pairByHolderId.set(holderId, { channel, lastPong: Date.now() });
+  ensureOwnerScanner();
+}
+
+/** Holder side of the liveness plane: one pair channel per owner (first acquire only). */
+function ensureHolderPair(
+  ownerId: string | undefined,
+  livenessPort: MessagePort | undefined,
+): HolderPair | undefined {
+  if (ownerId === undefined) return undefined;
+  const existing = pairByOwnerId.get(ownerId);
+  if (existing) {
+    livenessPort?.close();
+    return existing;
+  }
+  if (livenessPort === undefined) return undefined;
+  const channel = connectChannel(livenessPort);
+  const pair: HolderPair = { channel, lastPing: Date.now(), kills: new Set() };
+  channel.onMessage((message) => {
+    const frame = message as LivenessFrame;
+    if (frame.type === "ping") {
+      pair.lastPing = Date.now();
+      channel.send({ type: "pong" } satisfies LivenessFrame);
+    }
+  });
+  pairByOwnerId.set(ownerId, pair);
+  ensureHolderScanner();
+  return pair;
+}
+
+/** Owner sweep: ping every pair and time out holders that stopped ponging. */
+function ensureOwnerScanner(): void {
+  if (ownerScanner) return;
+  ownerScanner = setInterval(() => {
     const now = Date.now();
-    for (const [channel, last] of channelLastSeen) {
-      if (now - last > keepaliveTimeoutMs) {
-        // Zombie holder: release the object (broadcast + close + drop strong ref).
-        releaseRefId(channelRefId.get(channel) ?? "");
+    for (const [holderId, pair] of pairByHolderId) {
+      pair.channel.send({ type: "ping" } satisfies LivenessFrame);
+      if (now - pair.lastPong > livenessTimeoutMs) releaseHolder(holderId);
+    }
+  }, livenessIntervalMs);
+}
+
+/**
+ * Batch-release everything held by one dead holder worker: close its ref
+ * channels (onClosed untracks them and drops the strong hold once the last
+ * holder of a ref is gone) and post a SINGLE death notice to the main thread —
+ * one message per death, not one per reference. Live holders of the same refs
+ * are unaffected (per-holder cleanup, not a broadcast).
+ */
+function releaseHolder(holderId: string): void {
+  const pair = pairByHolderId.get(holderId);
+  if (pair === undefined) return;
+  pairByHolderId.delete(holderId);
+  for (const set of ownerChannelsByRefId.values()) {
+    for (const ch of [...set]) {
+      if (channelHolderId.get(ch) === holderId) ch.close();
+    }
+  }
+  pair.channel.close();
+  self.postMessage({ type: "__holder-dead", refId: holderId });
+}
+
+/** Holder sweep: fail the refs of an owner whose pings stopped (reverse detection). */
+function ensureHolderScanner(): void {
+  if (holderScanner) return;
+  holderScanner = setInterval(() => {
+    const now = Date.now();
+    for (const [ownerId, pair] of pairByOwnerId) {
+      if (now - pair.lastPing > livenessTimeoutMs) {
+        pairByOwnerId.delete(ownerId);
+        failOwner(pair);
       }
     }
-  }, Math.max(1_000, Math.floor(keepaliveTimeoutMs / 3)));
+  }, livenessIntervalMs);
+}
+
+/** The owner died: every proxy its refs created fails together (no hanging calls). */
+function failOwner(pair: HolderPair): void {
+  for (const kill of [...pair.kills]) kill();
+  pair.channel.close();
 }
 
 /**
@@ -144,7 +259,6 @@ function releaseRefId(refId: string): void {
   const channels = ownerChannelsByRefId.get(refId);
   if (channels) {
     for (const c of channels) {
-      channelLastSeen.delete(c);
       channelRefId.delete(c);
       c.send({ type: "released" } satisfies RefFrame);
       c.close();
@@ -171,7 +285,7 @@ const refIdFinalizer = new FinalizationRegistry<string>((id) => {
   const channels = ownerChannelsByRefId.get(id);
   if (channels) {
     for (const c of channels) {
-      channelLastSeen.delete(c);
+      channelRefId.delete(c);
       c.send({ type: "released" } satisfies RefFrame);
       c.close();
     }
@@ -215,9 +329,10 @@ type RefFrame =
   }
   | { type: "dispose" }
   /** Owner → all holders: the object was released; every proxy dies immediately. */
-  | { type: "released" }
-  /** Holder → owner: liveness heartbeat (owner releases zombies on timeout). */
-  | { type: "keepalive" };
+  | { type: "released" };
+
+/** Frames on the pair liveness channel (one channel per owner↔holder worker pair). */
+type LivenessFrame = { type: "ping" } | { type: "pong" };
 
 /**
  * Owner side: run the real object's methods for calls arriving on the channel.
@@ -294,9 +409,6 @@ function startRefOwner(
           } satisfies RefFrame,
         );
       }
-    } else if (frame.type === "keepalive") {
-      // Holder liveness: refresh the last-seen stamp for the timeout sweep.
-      channelLastSeen.set(channel, Date.now());
     } else if (frame.type === "dispose") {
       // Optional cleanup hook on the real object (mirrors generator finally);
       // skipped if the object was already released.
@@ -328,6 +440,15 @@ function createRefProxy(
   let closed = false;
   let unregisterRelease: () => void = () => {};
 
+  const fail = (reason: unknown): void => {
+    if (closed) return;
+    closed = true;
+    for (const call of pending.values()) call.reject(reason);
+    pending.clear();
+    channel.close();
+    onRemoved();
+  };
+
   channel.onMessage((message) => {
     const frame = message as RefFrame;
     if (frame.type === "result") {
@@ -340,23 +461,6 @@ function createRefProxy(
       fail(new Error("Reference released by its owner"));
     }
   });
-
-  // Holder liveness heartbeat: the owner releases zombie channels (a dead
-  // holder worker stops sending) after a timeout. Stops when the proxy dies.
-  const keepalive = setInterval(() => {
-    if (!closed) {
-      channel.send({ type: "keepalive" } satisfies RefFrame);
-    }
-  }, keepaliveIntervalMs);
-
-  const fail = (reason: unknown): void => {
-    if (closed) return;
-    closed = true;
-    clearInterval(keepalive);
-    for (const call of pending.values()) call.reject(reason);
-    pending.clear();
-    channel.close();
-  };
 
   const call = (method: string, args: unknown[]): Promise<unknown> => {
     if (closed) return Promise.reject(new Error("Remote ref is disposed"));
@@ -379,7 +483,6 @@ function createRefProxy(
   const dispose = (): void => {
     if (closed) return;
     closed = true;
-    clearInterval(keepalive);
     channel.send({ type: "dispose" } satisfies RefFrame);
     channel.close();
     for (const call of pending.values()) {
@@ -410,7 +513,6 @@ function createRefProxy(
   unregisterRelease = registerRelease(proxy, () => {
     channel.send({ type: "dispose" } satisfies RefFrame);
     fail(new Error("Remote ref garbage-collected"));
-    onRemoved();
   });
 
   return proxy;
@@ -531,7 +633,14 @@ function disposePending(refId: string, calls: PendingCall[]): Promise<void> {
 }
 
 /** __ref-acquired: a port for the pending ref arrived — materialize and flush. */
-function onRefAcquired(frame: { refId: string; port: MessagePort }): void {
+function onRefAcquiredInner(
+  frame: {
+    refId: string;
+    port: MessagePort;
+    ownerId?: string;
+    livenessPort?: MessagePort;
+  },
+): void {
   const entry = pendingByRefId.get(frame.refId);
   if (!entry) {
     frame.port.close();
@@ -540,8 +649,14 @@ function onRefAcquired(frame: { refId: string; port: MessagePort }): void {
   pendingByRefId.delete(frame.refId);
   const channel = connectChannel(frame.port);
   entry.registry.registerChannel(channel);
+  const pair = ensureHolderPair(frame.ownerId, frame.livenessPort);
   const real = createRefProxy(channel, entry.registry, entry.refId, () => {
     // proxy released: no dedupe table entry to clean (pending was removed).
+  });
+  // When the OWNER dies (reverse detection: its pings stop), this proxy — and
+  // every other proxy of that owner — fails together; no calls hang forever.
+  pair?.kills.add(() => {
+    real.dispose();
   });
   entry.real = real; // later calls on the pending proxy forward here
   const calls = entry.calls;
@@ -557,8 +672,13 @@ function onRefAcquired(frame: { refId: string; port: MessagePort }): void {
 }
 
 /** __serve-ref: the owner must register a fresh per-holder channel for this ref. */
-function onServeRef(
-  frame: { refId: string; port: MessagePort },
+function onServeRefInner(
+  frame: {
+    refId: string;
+    port: MessagePort;
+    holderId?: string;
+    livenessPort?: MessagePort;
+  },
   registry: EncodeContext["registry"] | DecodeContext["registry"],
 ): void {
   const obj = objByRefId.get(frame.refId)?.deref();
@@ -566,6 +686,8 @@ function onServeRef(
     frame.port.close(); // owner no longer holds the object: nothing to serve
     return;
   }
+  // Liveness plane (first serve of this holder only): owner-pull heartbeats.
+  ensureOwnerPair(frame.holderId, frame.livenessPort);
   const channel = connectChannel(frame.port, {
     onClosed: () => {
       untrackOwnerChannel(frame.refId, channel);
@@ -574,21 +696,47 @@ function onServeRef(
   });
   registry.registerChannel(channel);
   startRefOwner(channel, frame.refId, registry); // closure captures only the refId
-  trackOwnerChannel(frame.refId, channel);
+  trackOwnerChannel(frame.refId, channel, frame.holderId);
 }
 
 // Control handlers are module-global (worker/main single-threaded).
-registerControlHandler("__worker-id", (frame) => {
+const onWorkerId = (frame: ControlFrame): void => {
   workerIdPrefix = frame.refId; // reuse the refId field as the id carrier
-});
-registerControlHandler("__ref-acquired", (frame) => {
-  onRefAcquired(frame as { refId: string; port: MessagePort });
-});
-registerControlHandler("__serve-ref", (frame) => {
+};
+const onRefAcquiredFrame = (frame: ControlFrame): void => {
+  // __ref-acquired always carries the transferred port; ignore malformed frames.
+  if (frame.port === undefined) return;
+  onRefAcquiredInner({
+    refId: frame.refId,
+    port: frame.port,
+    ownerId: frame.ownerId,
+    livenessPort: frame.livenessPort,
+  });
+};
+const onServeRefFrame = (frame: ControlFrame): void => {
   const registry = getActiveRegistry();
   if (!registry) return; // no active worker registry (should not happen in a worker)
-  onServeRef(frame as { refId: string; port: MessagePort }, registry);
-});
+  if (frame.port === undefined) return; // __serve-ref always carries the port
+  onServeRefInner({
+    refId: frame.refId,
+    port: frame.port,
+    holderId: frame.holderId,
+    livenessPort: frame.livenessPort,
+  }, registry);
+};
+const onHolderDead = (_frame: ControlFrame): void => {
+  // Main-side only: the liveness sweep of a dead holder worker posts one
+  // __holder-dead notice per death. Nothing to do here beyond acknowledging it
+  // (worker-side holders are cleaned up when the owner releases their channels).
+};
+
+registerControlHandler("__worker-id", onWorkerId);
+registerControlHandler("__ref-acquired", onRefAcquiredFrame);
+registerControlHandler("__serve-ref", onServeRefFrame);
+// Registered everywhere, meaningful on the main thread: the death notice keeps
+// the main-side codec's module graph consistent (the notice frame is routed to
+// every module instance).
+registerControlHandler("__holder-dead", onHolderDead);
 
 interface RefCodecState {
   /**
@@ -607,6 +755,7 @@ interface RefCodecState {
 function trackOwnerChannel(
   refId: string,
   channel: Channel,
+  holderId: string | undefined,
 ): void {
   let set = ownerChannelsByRefId.get(refId);
   if (!set) {
@@ -615,8 +764,9 @@ function trackOwnerChannel(
   }
   set.add(channel);
   channelRefId.set(channel, refId);
-  channelLastSeen.set(channel, Date.now());
-  ensureKeepaliveScanner();
+  // Record which holder this channel belongs to: a dead holder is then released
+  // in one batch instead of per-channel sweeps.
+  if (holderId !== undefined) channelHolderId.set(channel, holderId);
   // First open channel: hold the object strongly (alive during holder use).
   const obj = objByRefId.get(refId)?.deref();
   if (obj !== undefined && !ownerStrongRefs.has(refId)) {
@@ -631,8 +781,8 @@ function untrackOwnerChannel(refId: string, channel: Channel): void {
   const set = ownerChannelsByRefId.get(refId);
   if (set) {
     set.delete(channel);
-    channelLastSeen.delete(channel);
     channelRefId.delete(channel);
+    channelHolderId.delete(channel);
     if (set.size === 0) {
       ownerChannelsByRefId.delete(refId);
       // Last channel closed: the object is now collectable (mode-2 release).
@@ -663,7 +813,8 @@ export const remoteRefCodec: Codec<RemoteRef<unknown>> = {
       });
       ctx.registry.registerChannel(channel);
       startRefOwner(channel, refId, ctx.registry);
-      trackOwnerChannel(refId, channel);
+      // Fresh tokens travel to the main thread only (no holder worker id).
+      trackOwnerChannel(refId, channel, undefined);
       return {
         [CODEC_PLACEHOLDER_KEY]: "remote-ref",
         refId,

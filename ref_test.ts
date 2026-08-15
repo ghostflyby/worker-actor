@@ -12,7 +12,7 @@ const REF_WORKER_URL = import.meta.resolve("./examples/remote_ref/worker.ts");
 const forceGc = (globalThis as { gc?: () => void }).gc;
 
 async function waitFor2(
-  probe: () => Promise<boolean>,
+  probe: () => boolean | Promise<boolean>,
   timeoutMs = 3_000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -28,6 +28,14 @@ async function yieldToEventLoop(times: number): Promise<void> {
 }
 
 function spawnRefActor() {
+  return spawn<typeof RefWorkerModule.rpc>(
+    new Worker(REF_WORKER_URL, { type: "module" }),
+    { codecs: [remoteRefCodec] },
+  );
+}
+
+/** A second actor (used as a reference holder). */
+function spawnHolder() {
   return spawn<typeof RefWorkerModule.rpc>(
     new Worker(REF_WORKER_URL, { type: "module" }),
     { codecs: [remoteRefCodec] },
@@ -309,24 +317,112 @@ Deno.test("release: owner releaseRef broadcasts — peers die immediately", asyn
   await b.dispose();
 });
 
-Deno.test("keepalive: a dead holder's channel is released after timeout", async () => {
-  const actor = await spawnRefActor();
-  await actor.disposedCount();
-  await actor.setKeepalive(50, 200); // fast params for the test
-  const ref = await actor.registerNamed("zombie") as RemoteRef<CounterRef>;
-  // Acquire, then terminate the holder worker hard (no dispose frame).
-  const b = await spawn<typeof RefWorkerModule.rpc>(
-    new Worker(REF_WORKER_URL, { type: "module" }),
-    { codecs: [remoteRefCodec] },
-  );
-  await b.holdRef(ref);
-  // Kill the holder without dispose: its heartbeat stops, the owner times out
-  // and releases the object. We cannot terminate the worker from here directly
-  // (no handle), so simulate by creating a holder that never heartbeats is not
-  // possible — instead rely on the owner releasing on timeout of a channel
-  // whose heartbeat is stopped by holder GC. To make this deterministic, the
-  // test only asserts releaseRef still works after keepalive params are set.
-  assertEquals(await actor.releaseRefByName("zombie"), "released");
-  await actor.dispose();
-  await b.dispose();
+Deno.test("liveness: a terminated holder's refs are released (owner-pull detection)", async () => {
+  // Deterministic dead-holder simulation: the owner PULLS heartbeats over one
+  // channel per worker pair, so terminating the holder worker (no dispose frame)
+  // stops the pongs and the owner releases its refs after the timeout.
+  const owner = await spawnRefActor();
+  await owner.disposedCount(); // warm up: routeable refId prefix
+  await owner.setLiveness(50, 250); // fast params for the test
+  const ref = await owner.registerNamed("zombie") as RemoteRef<CounterRef>;
+
+  const holder = await spawnHolder();
+  await holder.holdRef(ref);
+  assertEquals(await holder.callHeld(0), 1); // holder acquired (pair created)
+  // Two owner-side channels serve the object: the main thread's and the holder's.
+  assertEquals(await owner.holderChannelsFor("zombie"), 2);
+
+  // The holder worker is terminated hard: no dispose frame, pongs stop, and
+  // the owner's liveness sweep releases its ref channel after the timeout.
+  await holder.dispose();
+
+  // The holder's channel must be released by the liveness sweep; the main
+  // thread's own channel (this test still holds `ref`) stays open.
+  await waitFor2(async () => (await owner.holderChannelsFor("zombie")) === 1);
+  await owner.dispose();
+});
+
+Deno.test("liveness: killing one holder leaves other holders of the same ref alive", async () => {
+  const owner = await spawnRefActor();
+  await owner.disposedCount();
+  await owner.setLiveness(50, 250);
+  const ref = await owner.registerNamed("multi") as RemoteRef<CounterRef>;
+
+  const b1 = await spawnHolder();
+  const b2 = await spawnHolder();
+  await b1.holdRef(ref);
+  await b2.holdRef(ref);
+  assertEquals(await b1.callHeld(0), 1); // b1 acquired (pair with owner)
+  assertEquals(await b2.callHeld(0), 2); // b2 acquired (pair with owner)
+  await b1.dispose(); // only b1 dies
+
+  // b2 stays usable after b1's death: per-holder cleanup, not a broadcast.
+  await waitFor2(async () => {
+    return await b2.callHeld(0).then(
+      () => true,
+      () => false,
+    );
+  });
+  assertEquals(await owner.strongRefCount(), 1); // the shared object is still held by b2
+  await owner.dispose();
+  await b2.dispose();
+});
+
+Deno.test("liveness: reverse — a dead owner fails its holders' refs (no hanging calls)", async () => {
+  // The worker-level monitor is bidirectional: the holder detects the owner's
+  // death (its pings stop) and fails its refs instead of hanging. Both sides
+  // run their own liveness timers, so each needs the fast params.
+  const owner = await spawnRefActor();
+  await owner.disposedCount();
+  await owner.setLiveness(50, 250);
+  const ref = await owner.registerNamed("owner-dead") as RemoteRef<CounterRef>;
+
+  const holder = await spawnHolder();
+  await holder.setLiveness(50, 250); // holder-side detection cadence
+  await holder.holdRef(ref);
+  assertEquals(await holder.callHeld(0), 1); // pair established
+
+  // The owner worker dies; the holder must notice via the missing pings and
+  // reject subsequent calls (no calls hanging forever).
+  await owner.dispose();
+
+  const outcome = await Promise.race([
+    holder.callHeld(0).then(
+      () => "resolved" as const,
+      (e: unknown) => e,
+    ),
+    new Promise((r) => setTimeout(() => r("TIMEOUT"), 3_000)),
+  ]);
+  assert(outcome instanceof Error);
+  await holder.dispose();
+});
+
+Deno.test("liveness: the owner posts one death notice to main per dead holder", async () => {
+  // Worker-level monitoring, batch-release semantics: the owner releases a dead
+  // holder's refs together and posts exactly ONE __holder-dead notice to the
+  // main thread. The notice rides on the owner's main channel (a worker-level
+  // monitor message, not a per-reference one).
+  const ownerWorker = new Worker(REF_WORKER_URL, { type: "module" });
+  const owner = await spawn<typeof RefWorkerModule.rpc>(ownerWorker, {
+    codecs: [remoteRefCodec],
+  });
+  await owner.disposedCount();
+  await owner.setLiveness(50, 250);
+  const ref = await owner.registerNamed("notify") as RemoteRef<CounterRef>;
+
+  const holder = await spawnHolder();
+  await holder.holdRef(ref);
+  await holder.callHeld(0); // pair established
+
+  let notices = 0;
+  const listener = (ev: MessageEvent) => {
+    const frame = ev.data as { type?: string };
+    if (frame.type === "__holder-dead") notices++;
+  };
+  ownerWorker.addEventListener("message", listener);
+  await holder.dispose(); // the holder worker dies; owner notices via liveness
+  await waitFor2(() => notices === 1);
+  ownerWorker.removeEventListener("message", listener);
+  assertEquals(notices, 1);
+  await owner.dispose();
 });

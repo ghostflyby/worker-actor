@@ -45,6 +45,10 @@ export interface ControlFrame {
   type: string;
   refId: string;
   port?: MessagePort;
+  /** Holder/owner worker ids and the liveness pair port (acquire control frames). */
+  holderId?: string;
+  ownerId?: string;
+  livenessPort?: MessagePort;
 }
 
 type ControlHandler = (frame: ControlFrame) => void;
@@ -59,6 +63,14 @@ export function registerControlHandler(type: string, fn: ControlHandler): void {
     controlHandlers.set(type, set);
   }
   set.add(fn);
+}
+
+/** Remove a previously registered control handler (test/teardown use). */
+export function unregisterControlHandler(
+  type: string,
+  fn: ControlHandler,
+): void {
+  controlHandlers.get(type)?.delete(fn);
 }
 
 /** Dispatch a control frame to its registered handlers (worker runtime / main). */
