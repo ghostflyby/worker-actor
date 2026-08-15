@@ -1,0 +1,4 @@
+# Deno (deno.lock should be committed — it pins dependency versions)
+
+# Editor / OS
+.DS_Store
