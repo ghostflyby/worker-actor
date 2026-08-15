@@ -7,5 +7,14 @@
   "imports": {
     "@std/assert": "jsr:@std/assert@1"
   },
-  "exports": "./mod.ts"
+  "exports": {
+    ".": "./mod.ts",
+    "./codec": "./codec.ts",
+    "./channel": "./channel.ts",
+    "./rpc": "./rpc.ts",
+    "./stream": "./stream.ts",
+    "./codecs": "./codecs.ts",
+    "./types": "./types.ts",
+    "./protocol": "./protocol.ts"
+  }
 }

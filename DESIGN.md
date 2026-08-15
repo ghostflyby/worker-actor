@@ -25,19 +25,54 @@ protocol), a **proxy** (Proxy + incrementing ids correlating request/response),
 ## Project layout
 
 ```
-mod.ts                    # public exports
+mod.ts                    # default export: the common surface (spawn/link/pool/serveWorker/errors/types)
+codec.ts                  # sub-path: custom transport codecs (Codec, PayloadCodecRegistry)
+channel.ts                # sub-path: channel primitives for codec authors
+rpc.ts                    # sub-path: channel-agnostic RPC machinery
+stream.ts                 # sub-path: stream channel primitives
+codecs.ts                 # sub-path: the built-in codecs
+types.ts                  # sub-path: type-level projections
+protocol.ts               # sub-path: wire protocol details
 core/protocol.ts          # frame types, error serialization, handshake version
 core/codec.ts             # generic Codec interface + PayloadCodecRegistry (deep walk/placeholder/lifecycle)
 core/channel.ts           # high-level Channel abstraction for codec authors (open/connect/release)
-core/codecs/              # built-in codecs: iterable / error / abort-signal
+core/codecs/              # built-in codecs: iterable / error / abort-signal / callback
 core/stream.ts            # stream protocol on top of Channel (pump/rebuild/backpressure/release)
 spawn.ts                  # main-thread: spawn() → type-safe Proxy + lifecycle + codec validation
+pool.ts                   # actor pool: lightweight combinator over homogeneous workers
 worker_runtime.ts         # worker-side: serveWorker(api) registers RPC, handshake, dispatch
 examples/calculator/      # end-to-end example (worker.ts + main.ts)
 examples/remote_ref/      # custom marshal-by-ref codec (the .NET MarshalByRef pattern)
-test_fixtures/            # test-only worker for the codec mechanism
-main_test.ts / codec_test.ts / ref_test.ts  # integration tests over real Workers
+test_fixtures/            # test-only workers for the codec/link mechanisms
+main_test.ts / codec_test.ts / ref_test.ts / pool_test.ts  # integration tests over real Workers
 ```
+
+### Exports (default vs sub-paths)
+
+The default `mod.ts` stays lean: creation (`spawn`, `link`, `createActorPool`),
+the worker-side runtime (`serveWorker`), errors (`RemoteError`,
+`ActorDiedError`), and the core proxy types (`Remote`, `ActorHandle`,
+`SpawnOptions`, `WorkerApi`, `LinkHandle`, `ActorPool`, `ActorPoolOptions`,
+`RemoteCallback`). Advanced capabilities are orthogonal and imported on demand
+from sub-paths (declared in deno.json `exports`):
+
+- `…/codec` — write custom transport codecs (`Codec`, `PayloadCodecRegistry`,
+  `getCodecState`, placeholder helpers).
+- `…/channel` — channel primitives for codec authors (`openChannel`,
+  `connectChannel`, `registerRelease`, `Channel`).
+- `…/rpc` — the channel-agnostic RPC machinery (`createRpcProxy`,
+  `makeRpcHandler`, `PeerRpc`) for custom RPC channels.
+- `…/stream` — stream channel primitives (`createRemoteIterable`,
+  `startStreamProducer`).
+- `…/codecs` — the built-in codecs, for custom codec sets or overriding a
+  built-in tag (`iterableCodec`, `errorCodec`, `createErrorCodec`,
+  `abortSignalCodec`, `callbackCodec`).
+- `…/types` — type-level projections (`TransformCallbacks`, `SyncOrAsync`).
+- `…/protocol` — wire protocol details (`Frame`, `SerializedError`).
+
+Built-in codecs are registered automatically by `spawn`/`serveWorker`; a typical
+user never imports them. `attachLazyIterator` stays on the default export (it
+backs the `Remote` stream special case).
 
 ## Usage
 
