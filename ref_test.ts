@@ -206,3 +206,39 @@ Deno.test("acquire: multiple holders each get their own channel to the owner", a
   await actorB.dispose();
   await actorC.dispose();
 });
+
+Deno.test("acquire: multi-hop sharing A→main→B→C all reach the same owner object", async () => {
+  // A owns the shared Counter. The ref travels: A → main (direct) → B
+  // (refId token, acquire) → C (B's proxy re-encoded as a refId token,
+  // acquire). Every hop shares the identity; every holder ends with its own
+  // channel to A, and all calls reach the SAME object in A.
+  const ownerA = await spawnRefActor();
+  await ownerA.disposedCount(); // warm up: routeable refId prefix
+  const refFromA = await ownerA.sharedCounter() as RemoteRef<CounterRef>;
+
+  // main → B
+  const b = await spawn<typeof RefWorkerModule.rpc>(
+    new Worker(REF_WORKER_URL, { type: "module" }),
+    { codecs: [remoteRefCodec] },
+  );
+  await b.holdRef(refFromA);
+  assertEquals(await b.callHeld(0), 1); // B acquired → reaches A's object
+
+  // B → C: B returns its held proxy; the main thread re-encodes it as a
+  // refId token (sharing) and hands it to C.
+  const refViaB = await b.getHeldRef();
+  const c = await spawn<typeof RefWorkerModule.rpc>(
+    new Worker(REF_WORKER_URL, { type: "module" }),
+    { codecs: [remoteRefCodec] },
+  );
+  await c.holdRef(refViaB);
+  assertEquals(await c.callHeld(0), 2); // C acquired → same object in A
+  // B's own channel still works after the hand-off (share, not move).
+  assertEquals(await b.callHeld(0), 3);
+  // C again → 4: all three holders share one counter in A.
+  assertEquals(await c.callHeld(0), 4);
+
+  await ownerA.dispose();
+  await b.dispose();
+  await c.dispose();
+});
