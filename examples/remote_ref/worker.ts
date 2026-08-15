@@ -61,9 +61,25 @@ export const rpc = {
   sharedOwnerChannels(): number {
     return ownerChannelCountFor(shared);
   },
+  /** Hold a reference (proxy or fresh) so it can be handed off or called later. */
+  holdRef(ref: RemoteRef<unknown>): string {
+    heldRef = ref;
+    return "held";
+  },
+  /** Return the held reference: re-encoding a proxy triggers a hand-off (refId-only). */
+  getHeldRef(): RemoteRef<unknown> {
+    return heldRef!;
+  },
+  /** Call a method on the held reference (may trigger acquire on first use). */
+  callHeld(_x: number): Promise<number> {
+    return (heldRef as unknown as RemoteRef<{ increment(): Promise<number> }>)
+      .increment();
+  },
   disposedCount(): number {
     return disposedCount;
   },
 };
+
+let heldRef: RemoteRef<unknown> | undefined;
 
 serveWorker(rpc, { codecs: [remoteRefCodec] });

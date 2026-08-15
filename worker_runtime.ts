@@ -23,6 +23,11 @@ import { Frame, PROTOCOL_VERSION } from "./core/protocol.ts";
 import { type Codec, PayloadCodecRegistry } from "./core/codec.ts";
 import { type Channel, connectChannel } from "./core/channel.ts";
 import {
+  dispatchControlFrame,
+  setActiveRegistry,
+  setWorkerId,
+} from "./core/worker-context.ts";
+import {
   createRpcProxy,
   makeRpcHandler,
   type PeerRpc,
@@ -126,7 +131,10 @@ export function serveWorker(
   const post = (frame: Frame) => self.postMessage(frame);
   const links = new Map<string, Channel>();
   // The RPC machinery is channel-agnostic: the main channel and every link
-  // reuse the same handler/proxy factories from core/rpc.ts.
+  // reuse the same handler/proxy factories from core/rpc.ts. The registry is
+  // exposed module-level so codec control handlers (ref acquire) can
+  // materialize values in this worker's context.
+  setActiveRegistry(registry);
   const mainHandler = makeRpcHandler(api, registry);
 
   self.onmessage = async (ev: MessageEvent<Frame>) => {
@@ -240,6 +248,23 @@ export function serveWorker(
     if (frame.type === "__link-close") {
       links.get(frame.label)?.close();
       links.delete(frame.label);
+      return;
+    }
+    if (frame.type === "__worker-id") {
+      // Main-assigned stable id, embedded in refIds so the main thread can
+      // route acquire requests back to this worker. Also dispatched to codec
+      // control handlers (the ref codec adopts it as its refId prefix).
+      setWorkerId(frame.id);
+      dispatchControlFrame({ type: "__worker-id", refId: frame.id });
+      return;
+    }
+    if (
+      frame.type === "__serve-ref" || frame.type === "__ref-acquired"
+    ) {
+      // Reference-acquire control frames: dispatched to the ref codec's
+      // handlers (materialize the proxy on the acquired port, or register the
+      // fresh per-holder channel on the owner side).
+      dispatchControlFrame(frame);
       return;
     }
     if (frame.type === "dispose") {

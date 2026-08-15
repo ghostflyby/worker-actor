@@ -324,25 +324,31 @@ dedicated channel, errors serialized back, dispose/GC release, nested streams
 flowing through reference results). It is an example, not a built-in — the
 library stays protocol-agnostic.
 
-**Reference identity and restore** (the ActorRef semantics):
+**Reference identity, restore and indirect sharing** (the ActorRef semantics):
 
-- Every real object has a stable **refId** (registered on the owner side, with a
-  random per-process prefix so ids never collide across workers). Repeating
-  `remoteRef(x)` reuses the identity; a receiver dedupes by refId, so two refs
-  to the same object compare equal and share one proxy.
-- Handing a reference over is a **hand-off**: the identity travels on, and the
-  previous holder's channel is closed (per-holder connection to the owner). The
-  previous proxy becomes dead — the reference is single-holder at any time.
+- Every real object has a stable **refId** (the prefix is the owner worker's
+  main-assigned id, so refIds are globally unique AND routeable back to the
+  owner). Repeating `remoteRef(x)` reuses the identity; a receiver dedupes by
+  refId, so two refs to the same object compare equal and share one proxy.
+- Handing a reference over is a **share, not a move**: a proxy encodes as its
+  refId token only, and the original proxy stays alive. Any number of holders
+  can hold the same identity.
 - A reference that travels back to its **owner** is **restored**: the owner
   recognizes the refId, collapses it into a local call-through reference (no
   proxy, no channel — method calls run directly on the real object) and closes
-  the channels still open for it. This works after any number of hand-offs:
-  identity travels, the owner recognizes it home.
-- Only the owner can produce fresh references; a proxy holder can only hand the
-  reference along. A refId-only hand-off arriving at a non-owner is refused
-  loudly (the holder cannot re-establish the owner connection for a third
-  party). Channels are therefore never transferred — the reference is the
-  identity, not the wire.
+  the channels still open for it.
+- **Indirect sharing across workers**: when a refId token arrives at a
+  non-owner, a _pending proxy_ is created; its first call triggers an acquire
+  over the main channel (`__acquire-ref`). The main thread resolves the refId
+  prefix to the owner worker and bootstraps a fresh owner↔requester channel
+  (`__serve-ref` / `__ref-acquired`) — the main thread is only the one-time
+  router; the established channel is direct. Each holder gets its own per-holder
+  channel to the owner (per-holder FIFO), and all holders reach the SAME real
+  object. RefIds produced before the worker id arrives fall back to a random
+  prefix and are simply never acquire-routed.
+- Only the owner can produce fresh references; holders can only share the
+  identity. Channels are never transferred — the reference is the identity, not
+  the wire.
 
 ### Direct worker-to-worker links
 

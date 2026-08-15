@@ -44,6 +44,11 @@ import {
   openChannel,
   registerRelease,
 } from "../../core/channel.ts";
+import {
+  getActiveRegistry,
+  registerControlHandler,
+  triggerAcquire,
+} from "../../core/worker-context.ts";
 import { RemoteError, serializeError } from "../../core/protocol.ts";
 
 const REF_BRAND = Symbol.for("worker-actor-example.remote-ref");
@@ -51,10 +56,8 @@ const REF_BRAND = Symbol.for("worker-actor-example.remote-ref");
 const REF_PROXY_BRAND = Symbol.for("worker-actor-example.remote-ref.proxy");
 /** Marks a restored local call-through reference (traveled back to its owner). */
 const REF_LOCAL_BRAND = Symbol.for("worker-actor-example.remote-ref.local");
-/** refId of the real object this proxy refers to (for hand-off/restore). */
+/** refId of the real object this proxy refers to (for hand-off/acquire). */
 const REF_ID = Symbol.for("worker-actor-example.remote-ref.id");
-/** Detaches the underlying port for a hand-off (move semantics); the proxy then dies. */
-const REF_DETACH = Symbol.for("worker-actor-example.remote-ref.detach");
 
 /** The proxy type: every method returns a Promise; non-functions are `never`. */
 export type RemoteRef<T> =
@@ -87,11 +90,13 @@ export function ownerChannelCountFor(obj: object): number {
 }
 
 // —— Identity table (owner side) ——
-// refId must be unique across processes: every worker is a separate process
-// with its own module state, so a bare counter would collide (B's object #1
-// vs C's object #1). A random per-process prefix keeps ids globally unique.
-const PROCESS_ID = Math.random().toString(36).slice(2);
+// refId must be unique across processes and routeable to the owner: the prefix
+// is this worker's main-assigned id (set by __worker-id); before that arrives,
+// a random per-process fallback keeps ids unique (such ids are never
+// acquire-routed before the id is set, because acquire needs a routeable
+// prefix).
 let localRefCount = 0;
+let workerIdPrefix = Math.random().toString(36).slice(2);
 const refIdByObj = new WeakMap<object, string>();
 const objByRefId = new Map<string, WeakRef<object>>();
 const ownerChannelsByRefId = new Map<string, Set<Channel>>();
@@ -104,7 +109,7 @@ const refIdFinalizer = new FinalizationRegistry<string>((id) => {
 function refIdFor(obj: object): string {
   const existing = refIdByObj.get(obj);
   if (existing !== undefined) return existing;
-  const id = `${PROCESS_ID}:${++localRefCount}`;
+  const id = `${workerIdPrefix}:${++localRefCount}`;
   refIdByObj.set(obj, id);
   objByRefId.set(id, new WeakRef(obj));
   refIdFinalizer.register(obj, id);
@@ -262,27 +267,10 @@ function createRefProxy(
     onRemoved();
   };
 
-  // Move semantics: the reference's identity travels on; the holder's channel
-  // is closed (it was a per-holder connection to the owner; Deno won't let a
-  // handler-attached port be transferred, and the owner restores by refId
-  // alone). The local proxy dies after this.
-  const detachForTransfer = (): void => {
-    if (closed) throw new Error("Remote ref is disposed; cannot transfer");
-    closed = true;
-    for (const call of pending.values()) {
-      call.reject(new Error("Remote ref transferred"));
-    }
-    pending.clear();
-    unregisterRelease();
-    onRemoved();
-    channel.close();
-  };
-
   const proxy = new Proxy({} as RemoteRef<unknown>, {
     get(_target, prop) {
       if (prop === REF_PROXY_BRAND) return true;
       if (prop === REF_ID) return refId;
-      if (prop === REF_DETACH) return detachForTransfer;
       if (prop === "dispose") return dispose;
       if (prop === Symbol.dispose) return () => void dispose();
       // The proxy must not be detected as a thenable, or await behavior breaks.
@@ -336,6 +324,150 @@ function createLocalRef(obj: object): RemoteRef<unknown> {
   });
 }
 
+// —— Indirect sharing: a refId-only hand-off arrives at a non-owner. ——
+// The identity travels; the channel is per-holder and must be established via
+// the main thread (the only peer that can route between workers). The pending
+// proxy queues calls until __ref-acquired delivers a port, then materializes
+// the real proxy and flushes them.
+interface PendingCall {
+  method: string;
+  args: unknown[];
+  resolve: (value: unknown) => void;
+  reject: (reason: unknown) => void;
+}
+
+interface PendingEntry {
+  proxy: RemoteRef<unknown>;
+  calls: PendingCall[];
+  registry: DecodeContext["registry"];
+  refId: string;
+  /** The materialized real proxy once the acquire completes; later calls forward here. */
+  real?: RemoteRef<unknown>;
+}
+
+// Module-level pending registry (worker/main: single-threaded, race-free).
+const pendingByRefId = new Map<string, PendingEntry>();
+
+function createPendingProxy(
+  refId: string,
+  ctx: DecodeContext,
+): RemoteRef<unknown> {
+  const existing = pendingByRefId.get(refId);
+  if (existing) return existing.proxy;
+  const calls: PendingCall[] = [];
+  const registry = ctx.registry;
+  const entry: PendingEntry = {
+    proxy: undefined as never,
+    calls,
+    registry,
+    refId,
+  };
+  const proxy = new Proxy({} as RemoteRef<unknown>, {
+    get(_target, prop) {
+      if (prop === REF_PROXY_BRAND) return true;
+      if (prop === REF_ID) return refId;
+      if (prop === "dispose") return () => disposePending(refId, calls);
+      if (prop === Symbol.dispose) {
+        return () => void disposePending(refId, calls);
+      }
+      if (prop === "then") return undefined;
+      if (typeof prop === "string") {
+        return (...args: unknown[]) => {
+          // Once acquired, forward to the real proxy (later calls must not
+          // queue into the already-flushed pending list).
+          if (entry.real) {
+            return (entry.real as unknown as Record<
+              string,
+              (...a: unknown[]) => Promise<unknown>
+            >)[
+              prop
+            ](...args);
+          }
+          // First call triggers the acquire; subsequent calls queue too.
+          triggerAcquire(refId);
+          return new Promise<unknown>((resolve, reject) => {
+            calls.push({ method: prop, args, resolve, reject });
+          });
+        };
+      }
+      return undefined;
+    },
+  });
+  entry.proxy = proxy;
+  pendingByRefId.set(refId, entry);
+  return proxy;
+}
+
+function disposePending(refId: string, calls: PendingCall[]): Promise<void> {
+  pendingByRefId.delete(refId);
+  for (const c of calls) {
+    c.reject(new Error("Remote ref disposed before acquire completed"));
+  }
+  calls.length = 0;
+  return Promise.resolve();
+}
+
+/** __ref-acquired: a port for the pending ref arrived — materialize and flush. */
+function onRefAcquired(frame: { refId: string; port: MessagePort }): void {
+  const entry = pendingByRefId.get(frame.refId);
+  if (!entry) {
+    frame.port.close();
+    return;
+  }
+  pendingByRefId.delete(frame.refId);
+  const channel = connectChannel(frame.port);
+  entry.registry.registerChannel(channel);
+  const real = createRefProxy(channel, entry.registry, entry.refId, () => {
+    // proxy released: no dedupe table entry to clean (pending was removed).
+  });
+  entry.real = real; // later calls on the pending proxy forward here
+  const calls = entry.calls;
+  entry.calls = [];
+  for (const c of calls) {
+    const p =
+      (real as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>)
+        [
+          c.method
+        ](...c.args);
+    p.then(c.resolve, c.reject);
+  }
+}
+
+/** __serve-ref: the owner must register a fresh per-holder channel for this ref. */
+function onServeRef(
+  frame: { refId: string; port: MessagePort },
+  registry: EncodeContext["registry"] | DecodeContext["registry"],
+): void {
+  const obj = objByRefId.get(frame.refId)?.deref();
+  if (obj === undefined) {
+    frame.port.close(); // owner no longer holds the object: nothing to serve
+    return;
+  }
+  const channel = connectChannel(frame.port);
+  registry.registerChannel(channel);
+  startRefOwner(channel, obj, registry);
+  // Track as an owner-side channel so a round-trip home can close it.
+  let set = ownerChannelsByRefId.get(frame.refId);
+  if (!set) {
+    set = new Set();
+    ownerChannelsByRefId.set(frame.refId, set);
+  }
+  set.add(channel);
+}
+
+// Control handlers are module-global (worker/main single-threaded).
+registerControlHandler("__worker-id", (frame) => {
+  workerIdPrefix = frame.refId; // reuse the refId field as the id carrier
+});
+registerControlHandler("__ref-acquired", (frame) => {
+  onRefAcquired(frame as { refId: string; port: MessagePort });
+});
+registerControlHandler("__serve-ref", (frame) => {
+  const registry = getActiveRegistry();
+  if (!registry) return; // no active worker registry (should not happen in a worker)
+  onServeRef(frame as { refId: string; port: MessagePort }, registry);
+});
+
 interface RefCodecState {
   /**
    * Dedupe per receiver: the same refId (same identity) reuses one proxy.
@@ -375,13 +507,11 @@ export const remoteRefCodec: Codec<RemoteRef<unknown>> = {
         port: peerPort,
       } satisfies RefHandle;
     }
-    // Move semantics: the reference's identity travels on; the holder's channel
-    // is closed (it was a per-holder connection to the owner). No port is
-    // transferred — Deno refuses to transfer ports that have a message handler
-    // attached, and the owner restores by refId alone. The local proxy dies.
+    // Sharing semantics: a proxy encodes as its refId token only. The holder's
+    // proxy stays alive; the receiver acquires a fresh per-holder channel via
+    // the main thread on first use. Any number of holders can share the same
+    // identity, each with its own channel to the owner.
     const refId = ref[REF_ID] as string;
-    const detach = ref[REF_DETACH] as () => void;
-    detach();
     return {
       [CODEC_PLACEHOLDER_KEY]: "remote-ref",
       refId,
@@ -395,23 +525,18 @@ export const remoteRefCodec: Codec<RemoteRef<unknown>> = {
     // present) and refId-only hand-off arrivals.
     const obj = objByRefId.get(refId)?.deref();
     if (obj !== undefined) {
+      // Restore: the reference came home. Under sharing semantics other
+      // holders keep their own channels, so only the arriving port (if any)
+      // is closed — never the whole per-holder set.
       port?.close();
-      const channels = ownerChannelsByRefId.get(refId);
-      if (channels) {
-        for (const c of channels) c.close();
-        ownerChannelsByRefId.delete(refId);
-      }
       return createLocalRef(obj);
     }
     if (port === undefined) {
-      // A refId-only hand-off arrived at a non-owner. The channel is a
-      // per-holder connection to the owner; a proxy holder cannot re-establish
-      // it for a third party, so this is unsupported — fail loudly instead of
-      // silently producing a dead reference.
-      throw new Error(
-        `remote-ref hand-off for unknown refId "${refId}": only the owner can restore, ` +
-          "and channel hand-offs to third parties are unsupported",
-      );
+      // A refId-only hand-off arrived at a non-owner. The identity travels;
+      // the channel is a per-holder connection that must be established via
+      // the main thread (the only peer that can route between workers). Return
+      // a pending proxy: its first call triggers the acquire.
+      return createPendingProxy(refId, ctx);
     }
     // Receiver side: the same identity reuses one proxy (refs are comparable).
     const state = getCodecState<RefCodecState>(ctx, remoteRefCodec, () => ({

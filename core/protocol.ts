@@ -57,7 +57,15 @@ export type Frame =
   /** Worker-runtime internal: establish a direct link channel between two workers (label-scoped). */
   | { type: "__link"; label: string; port: MessagePort }
   /** Worker-runtime internal: tear down a link channel by label. */
-  | { type: "__link-close"; label: string };
+  | { type: "__link-close"; label: string }
+  /** Main → worker: this worker's stable id (embedded in refIds for acquire routing). */
+  | { type: "__worker-id"; id: string }
+  /** Worker → main: request a channel to the owner of a reference (refId embeds the owner id). */
+  | { type: "__acquire-ref"; refId: string }
+  /** Main → owner: serve this reference's object over the given fresh port (per-holder channel). */
+  | { type: "__serve-ref"; refId: string; port: MessagePort }
+  /** Main → requester: here is the acquired channel; materialize the proxy. */
+  | { type: "__ref-acquired"; refId: string; port: MessagePort };
 
 /** Built-in Error constructors whose instances structured-clone natively (identity preserved). */
 const NATIVE_ERROR_CONSTRUCTORS = new Set<ErrorConstructor>([

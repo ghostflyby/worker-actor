@@ -15,6 +15,7 @@ import { ActorDiedError, Frame, PROTOCOL_VERSION } from "./core/protocol.ts";
 import { type Codec, PayloadCodecRegistry } from "./core/codec.ts";
 import { createRpcProxy } from "./core/rpc.ts";
 import type { TransformCallbacks } from "./core/type-utils.ts";
+import { dispatchControlFrame, setMainAcquire } from "./core/worker-context.ts";
 import { iterableCodec } from "./core/codecs/iterable.ts";
 import { errorCodec } from "./core/codecs/error.ts";
 import { abortSignalCodec } from "./core/codecs/abort_signal.ts";
@@ -86,6 +87,50 @@ export interface SpawnOptions {
 }
 
 const HANDSHAKE_TIMEOUT = 10_000;
+
+// Reference-acquire routing: each spawned worker gets a stable id (embedded in
+// refIds as a prefix), so the main thread can resolve "refId → owner worker"
+// and bootstrap an owner↔requester channel on demand. The requester is either
+// a worker (a __acquire-ref frame arrived from it) or the main thread itself.
+let nextWorkerId = 1;
+const workersById = new Map<string, Worker>();
+
+function routeAcquire(refId: string, requester: Worker): void {
+  // refId format: "<ownerWorkerId>:<localCount>"
+  const ownerId = refId.slice(0, refId.indexOf(":"));
+  const owner = workersById.get(ownerId);
+  if (!owner) return; // unknown or dead owner: nothing to bootstrap
+  const { port1, port2 } = new MessageChannel();
+  owner.postMessage(
+    { type: "__serve-ref", refId, port: port1 } satisfies Frame,
+    {
+      transfer: [port1],
+    },
+  );
+  requester.postMessage(
+    { type: "__ref-acquired", refId, port: port2 } satisfies Frame,
+    { transfer: [port2] },
+  );
+}
+
+/** Main-side acquire: the main thread itself is the requester (materialize locally). */
+function routeAcquireMain(refId: string): void {
+  const ownerId = refId.slice(0, refId.indexOf(":"));
+  const owner = workersById.get(ownerId);
+  if (!owner) return;
+  const { port1, port2 } = new MessageChannel();
+  owner.postMessage(
+    { type: "__serve-ref", refId, port: port1 } satisfies Frame,
+    {
+      transfer: [port1],
+    },
+  );
+  dispatchControlFrame({ type: "__ref-acquired", refId, port: port2 });
+}
+
+// Registered once per module load: any main-side pending ref (created while
+// decoding responses) triggers direct routing + local materialization.
+setMainAcquire(routeAcquireMain);
 
 /**
  * Make a stream-returning method's promise directly consumable via `for await`
@@ -196,6 +241,12 @@ export async function spawn<T>(
       ),
     isDead: () => dead,
   });
+  // Assign a stable worker id (embedded in refIds) and register it for acquire
+  // routing. The id is sent after the handshake so the worker is definitely
+  // ready; FIFO ordering on the channel guarantees it arrives before any
+  // user request.
+  const workerId = `w${nextWorkerId++}`;
+  workersById.set(workerId, worker);
   let dead = false;
   let resolveHandshake: (() => void) | undefined;
   let rejectHandshake: ((reason: unknown) => void) | undefined;
@@ -233,11 +284,19 @@ export async function spawn<T>(
         );
         return;
       }
+      // Tell the worker its id (for refIds); FIFO after the handshake.
+      worker.postMessage({ type: "__worker-id", id: workerId } satisfies Frame);
       resolveHandshake?.();
       return;
     }
     if (frame.type === "response") {
       rpcProxy.deliver(frame);
+      return;
+    }
+    if (frame.type === "__acquire-ref") {
+      // A worker requests a channel to the owner of a reference; this worker
+      // is the requester.
+      routeAcquire(frame.refId, worker);
     }
   };
 
@@ -259,6 +318,8 @@ export async function spawn<T>(
     // reject it so spawn() fails instead of hanging.
     rejectHandshake?.(reason);
     worker.terminate();
+    // A dead worker can no longer serve references: drop it from acquire routing.
+    workersById.delete(workerId);
     // Notify the owner (e.g. an actor pool) so it can remove/replace the member.
     // Deliberately NOT fired by dispose(): a deliberate shutdown is not a death.
     options.onDeath?.(reason);

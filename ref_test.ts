@@ -95,9 +95,6 @@ Deno.test("remote ref: calls after dispose reject", async () => {
 Deno.test("remote ref: GC of the proxy releases the owner (best-effort)", async () => {
   const actor = await spawnRefActor();
   if (!forceGc) {
-    console.log(
-      "  (skipped forced collection: run with --v8-flags=--expose-gc)",
-    );
     await actor.dispose();
     return;
   }
@@ -148,19 +145,64 @@ Deno.test("restore: reference back to owner collapses to a local direct call", a
     await actor.callBack(await actor.sharedCounter() as RemoteRef<CounterRef>),
     2,
   );
-  // Restoring closed the owner-side channels for the shared counter.
-  assertEquals(await actor.sharedOwnerChannels(), 0);
+  // Sharing semantics keep other holder channels alive (restore only closes
+  // the arriving port): the owner-side channels stay tracked.
+  assert(await actor.sharedOwnerChannels() > 0);
   await actor.dispose();
 });
 
-Deno.test("transfer: the original proxy dies after its port is handed off", async () => {
+Deno.test("sharing: re-encoding a proxy keeps the original usable (share, not move)", async () => {
   const actor = await spawnRefActor();
   const r1 = await actor.sharedCounter() as RemoteRef<CounterRef>;
-  await actor.acceptBack(r1); // r1's underlying port was transferred back
-  const outcome = await r1.increment().then(
-    () => "unexpectedly resolved" as const,
-    (e: unknown) => e,
-  );
-  assert(outcome instanceof Error);
+  // Hand the proxy back to its owner (restore). Sharing semantics keep r1
+  // usable: the identity is restored locally, the proxy is not killed.
+  assertEquals(await actor.acceptBack(r1), "local");
   await actor.dispose();
+});
+
+// —— Indirect sharing: refId-only hand-off across workers (main bootstraps) ——
+
+Deno.test("acquire: a handed-off reference is acquired and called across workers", async () => {
+  // A owns the shared Counter; B receives A's ref via a refId-only hand-off
+  // (main relays the proxy, bootstraps a fresh A↔B channel on first use).
+  const ownerA = await spawnRefActor();
+  await ownerA.disposedCount();
+  const workerB = new Worker(
+    import.meta.resolve("./examples/remote_ref/worker.ts"),
+    { type: "module" },
+  );
+  const actorB = await spawn<typeof RefWorkerModule.rpc>(workerB, {
+    codecs: [remoteRefCodec],
+  });
+  // Main gets a fresh ref from A.
+  const refFromA = await ownerA.sharedCounter() as RemoteRef<CounterRef>;
+  await actorB.holdRef(refFromA);
+  assertEquals(await actorB.callHeld(0), 1); // shared counter in A → 1
+  assertEquals(await actorB.callHeld(0), 2);
+  await ownerA.dispose();
+  await actorB.dispose();
+});
+
+Deno.test("acquire: multiple holders each get their own channel to the owner", async () => {
+  const ownerA = await spawnRefActor();
+  await ownerA.disposedCount(); // warm up: routeable refId prefix
+  const mk = () =>
+    spawn<typeof RefWorkerModule.rpc>(
+      new Worker(import.meta.resolve("./examples/remote_ref/worker.ts"), {
+        type: "module",
+      }),
+      { codecs: [remoteRefCodec] },
+    );
+  const actorB = await mk();
+  const actorC = await mk();
+  const refFromA = await ownerA.sharedCounter() as RemoteRef<CounterRef>;
+  await actorB.holdRef(refFromA);
+  await actorC.holdRef(refFromA);
+  // Both acquire independently; each reaches the SAME shared counter in A.
+  assertEquals(await actorB.callHeld(0), 1);
+  assertEquals(await actorC.callHeld(0), 2);
+  assertEquals(await actorB.callHeld(0), 3);
+  await ownerA.dispose();
+  await actorB.dispose();
+  await actorC.dispose();
 });

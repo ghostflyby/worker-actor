@@ -146,7 +146,7 @@ Deno.test("link rpc: bidirectional — B calls C's served surface", async () => 
 
 Deno.test("link ref round-trip: B hands shared ref to C, C hands it back, B restores", async () => {
   const { actorB, actorC } = await spawnLinked();
-  await actorB.sendSharedToC(); // B's shared Counter ref → C over the link
+  await actorB.sendSharedToC();
   const gotRef = await waitFor(() => actorC.getLastIsRef());
   assert(gotRef, "C should receive the reference over the link");
   assertEquals(await actorC.callLastIncrement(), 1); // executes in B
