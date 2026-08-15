@@ -204,6 +204,34 @@ locking, and the original is disturbed afterwards. Use native cloning when the
 stream is handed over once for consumption; to keep the original usable or hook
 lifecycle, go through the iterable channel via `rs[Symbol.asyncIterator]()`.
 
+### Callback / function by-ref
+
+A bare function cannot be structured-cloned, so any function value in a payload
+is automatically turned into a **remote callback** (`core/codecs/callback.ts`):
+the caller gets a directly callable reference, and invoking it executes the
+function at its registration point (its closure) and marshals the result back.
+No explicit wrapping — `longTask(n, (p) => progress(p))` just works; nested
+fields (`{ onDone: fn }`) travel byref automatically too.
+
+Mechanism-wise a callback is a **single-function Actor**, reusing the exact RPC
+machinery of the main channel and links:
+
+- owner side: `makeRpcHandler({ call: fn }, registry)` over a per-callback
+  MessageChannel — the function runs in this context, results/errors round-trip
+  through the registry;
+- calling side: `createRpcProxy` + a function-targeted Proxy whose `apply` trap
+  marshals the call; the promise stays a real promise (await/.catch work);
+  `dispose()` releases it.
+
+Lifecycle matches remote-ref: explicit `dispose()`, GC-based release
+(FinalizationRegistry, best-effort), and failAll (the registry closes the
+channel). Callbacks are **behavior, not identity**: there is no refId, hand-off,
+or restore — and a callback reference cannot be re-encoded (encoding one fails
+loudly, since a proxy holder must not re-route the owner connection to a third
+party). Types stay ordinary: the worker writes `(x: number) => number` and the
+calling side passes a raw function; `RemoteCallback<A, R>` and `Callback<A, R>`
+are optional annotation helpers.
+
 ### Channel abstraction for custom protocols
 
 The stream primitives are a special case of a more general need: a codec often

@@ -155,9 +155,14 @@ export class PayloadCodecRegistry {
     transfer: Transferable[],
     seen: WeakMap<object, unknown>,
   ): unknown {
-    if (v === null || typeof v !== "object") return v;
-    const cached = seen.get(v);
-    if (cached !== undefined) return cached;
+    // Functions are objects too: consult the seen map for them, and run the
+    // codec matches BEFORE the primitive short-circuit — the callback codec
+    // turns bare functions into byref references, so they must not fall
+    // through to structured clone (which throws DataCloneError for functions).
+    if (v !== null && (typeof v === "object" || typeof v === "function")) {
+      const cached = seen.get(v as object);
+      if (cached !== undefined) return cached;
+    }
     // Custom codecs take precedence over container recursion: the first match takes over.
     for (const codec of this.#order) {
       if (codec.matches(v)) {
@@ -167,10 +172,13 @@ export class PayloadCodecRegistry {
           codecState: this.#codecState,
           registry: this,
         });
-        seen.set(v, placeholder);
+        if (v !== null && (typeof v === "object" || typeof v === "function")) {
+          seen.set(v as object, placeholder);
+        }
         return placeholder;
       }
     }
+    if (v === null || typeof v !== "object") return v;
     if (Array.isArray(v)) {
       const out = new Array<unknown>(v.length);
       seen.set(v, out);

@@ -1,5 +1,6 @@
 /** Example worker: the exported rpc object is the Actor's API surface. */
 import { serveWorker } from "../../worker_runtime.ts";
+import type { RemoteCallback } from "../../core/codecs/callback.ts";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -122,8 +123,9 @@ export const rpc = {
   },
 
   /**
-   * 消费主线程传来的同步 Iterable/状态化 Iterator（iterable codec 包装入通道，
-   * 接收侧统一重建为 AsyncIterable；for await 同时兼容同步/异步）。
+   * Consumes a sync Iterable/stateful Iterator from the main thread (the
+   * iterable codec wraps it into a channel; the receiver side rebuilds it as
+   * AsyncIterable; for await accepts both sync and async).
    */
   sumSyncIterator(it: Iterable<number>): Promise<number> {
     return (async () => {
@@ -170,6 +172,55 @@ export const rpc = {
   whatIsIt(v: { [Symbol.asyncIterator]?: unknown }): string {
     return typeof v[Symbol.asyncIterator] === "function" ? "iterable" : "plain";
   },
+
+  /** Callback byref: worker calls the raw function passed from the main thread. */
+  callCallback(cb: (x: number) => number): Promise<number> {
+    // At runtime cb is a RemoteCallback (returns a Promise); Promise.resolve
+    // flattens it. The worker writes it as an ordinary function — that is the
+    // point of automatic byref.
+    return Promise.resolve(cb(21));
+  },
+
+  /** Async callback: result is awaited across the channel. */
+  callAsyncCallback(cb: (x: string) => Promise<string>): Promise<string> {
+    return cb("hello");
+  },
+
+  /** Nested field: a function inside an object also travels byref automatically. */
+  callNestedCallback(opts: { onDone: (v: number) => string }): Promise<string> {
+    return Promise.resolve(opts.onDone(7));
+  },
+
+  /** Callback that throws: the error surfaces at the main-thread registration point. */
+  callThrowingCallback(cb: (x: number) => number): Promise<unknown> {
+    return Promise.resolve(cb(1)).catch((e) => e);
+  },
+
+  /** Re-encode probe: passing a callback reference back must fail loudly. */
+  reencodeCallback(cb: (x: number) => number): string {
+    return typeof cb;
+  },
+
+  /** Hold a callback reference persistently (so tests can dispose it). */
+  holdCallback(cb: (x: number) => number): string {
+    heldCallback = cb as unknown as RemoteCallback<[number], number>;
+    return "held";
+  },
+  /** Call the held callback reference. */
+  callHeld(x: number): Promise<number> {
+    return Promise.resolve(heldCallback!(x));
+  },
+  /** Dispose the held callback reference. */
+  disposeHeld(): string {
+    heldCallback!.dispose();
+    return "disposed";
+  },
+  /** Return the held callback reference (re-encoding a proxy must fail loudly). */
+  returnHeld(): (x: number) => number {
+    return heldCallback as unknown as (x: number) => number;
+  },
 };
+
+let heldCallback: RemoteCallback<[number], number> | undefined;
 
 serveWorker(rpc);

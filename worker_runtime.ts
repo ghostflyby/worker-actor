@@ -31,6 +31,7 @@ import {
 import { iterableCodec } from "./core/codecs/iterable.ts";
 import { errorCodec } from "./core/codecs/error.ts";
 import { abortSignalCodec } from "./core/codecs/abort_signal.ts";
+import { callbackCodec } from "./core/codecs/callback.ts";
 
 // Deno types `self` as Window by default; in a worker script it is actually a
 // DedicatedWorkerGlobalScope. Only the members used are declared here, so we
@@ -112,7 +113,14 @@ export function serveWorker(
   const registry = new PayloadCodecRegistry();
   // User codecs register first (can override a built-in of the same tag); built-ins fill in after.
   for (const codec of options.codecs ?? []) registry.register(codec);
-  for (const codec of [iterableCodec, errorCodec, abortSignalCodec]) {
+  for (
+    const codec of [
+      iterableCodec,
+      errorCodec,
+      abortSignalCodec,
+      callbackCodec,
+    ]
+  ) {
     if (!registry.has(codec.tag)) registry.register(codec);
   }
   const post = (frame: Frame) => self.postMessage(frame);

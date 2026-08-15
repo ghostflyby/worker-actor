@@ -17,6 +17,7 @@ import { createRpcProxy } from "./core/rpc.ts";
 import { iterableCodec } from "./core/codecs/iterable.ts";
 import { errorCodec } from "./core/codecs/error.ts";
 import { abortSignalCodec } from "./core/codecs/abort_signal.ts";
+import { callbackCodec } from "./core/codecs/callback.ts";
 
 // The RPC boundary is inherently dynamic: type safety comes from Remote<T>
 // deriving the worker's concrete signatures, and this any only serves shape
@@ -109,7 +110,14 @@ export async function spawn<T>(
   const registry = new PayloadCodecRegistry();
   // User codecs register first (can override a built-in of the same tag); built-ins fill in after.
   for (const codec of options.codecs ?? []) registry.register(codec);
-  for (const codec of [iterableCodec, errorCodec, abortSignalCodec]) {
+  for (
+    const codec of [
+      iterableCodec,
+      errorCodec,
+      abortSignalCodec,
+      callbackCodec,
+    ]
+  ) {
     if (!registry.has(codec.tag)) registry.register(codec);
   }
   // The RPC machinery is channel-agnostic (core/rpc.ts): the main channel is
