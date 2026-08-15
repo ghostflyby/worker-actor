@@ -12,6 +12,11 @@ function makeActor() {
   );
 }
 
+interface ThrowerActor extends Awaited<ReturnType<typeof makeActor>> {
+  throwDom(): Promise<never>;
+  throwCustomSub(): Promise<never>;
+}
+
 Deno.test("basic typed RPC", async () => {
   const actor = await makeActor();
   assertEquals(await actor.add(1, 2), 3);
@@ -161,4 +166,43 @@ Deno.test("disposing actor mid-stream rejects pending pulls", async () => {
   );
   assertInstanceOf(outcome, RemoteError);
   assertEquals(outcome.name, "ActorDiedError");
+});
+
+Deno.test("RemoteError.inner: built-in Error keeps instanceof identity", async () => {
+  const actor = await makeActor();
+  const outcome = await actor.divide(1, 0).then(
+    () => "unexpectedly resolved" as const,
+    (e: unknown) => e,
+  );
+  assertInstanceOf(outcome, RemoteError);
+  assertEquals(outcome.name, "RangeError");
+  // the structured clone preserves the built-in identity
+  assertInstanceOf(outcome.inner, RangeError);
+  assertEquals(outcome.inner?.message, "division by zero");
+  await actor.dispose();
+});
+
+Deno.test("RemoteError.inner: DOMException keeps instanceof and code", async () => {
+  const actor = await makeActor() as ThrowerActor;
+  const outcome = await actor.throwDom().then(
+    () => "unexpectedly resolved" as const,
+    (e: unknown) => e,
+  );
+  assertInstanceOf(outcome, RemoteError);
+  assertEquals(outcome.name, "InvalidStateError");
+  assertInstanceOf(outcome.inner, DOMException);
+  assertEquals(outcome.inner?.code, DOMException.INVALID_STATE_ERR);
+  await actor.dispose();
+});
+
+Deno.test("RemoteError.inner: custom subclass attaches no inner (manual-only)", async () => {
+  const actor = await makeActor() as ThrowerActor;
+  const outcome = await actor.throwCustomSub().then(
+    () => "unexpectedly resolved" as const,
+    (e: unknown) => e,
+  );
+  assertInstanceOf(outcome, RemoteError);
+  assertEquals(outcome.name, "SubError"); // manual serialization keeps the name
+  assertEquals(outcome.inner, undefined); // clone would degrade, so none
+  await actor.dispose();
 });

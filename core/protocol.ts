@@ -26,6 +26,16 @@ export interface SerializedError {
   name: string;
   message: string;
   stack?: string;
+  /**
+   * The original error, structured-cloned alongside the manual fields. Only
+   * attached for known natively-cloneable types (built-in Error subclasses and
+   * DOMException): the clone preserves instanceof identity and DOMException's
+   * `code`. Custom subclasses and errors with custom properties stay
+   * manual-only (their clone would degrade, so it adds nothing). Best-effort:
+   * if the clone would fail, the field is dropped and the manual fields still
+   * carry the error.
+   */
+  native?: Error | DOMException;
 }
 
 export type Frame =
@@ -49,19 +59,66 @@ export type Frame =
   /** Worker-runtime internal: tear down a link channel by label. */
   | { type: "__link-close"; label: string };
 
+/** Built-in Error constructors whose instances structured-clone natively (identity preserved). */
+const NATIVE_ERROR_CONSTRUCTORS = new Set<ErrorConstructor>([
+  Error,
+  EvalError,
+  RangeError,
+  ReferenceError,
+  SyntaxError,
+  TypeError,
+  URIError,
+]);
+
+/** Known natively-cloneable error types: the clone adds real value (identity / code). */
+function isNativelyCloneableError(e: Error | DOMException): boolean {
+  return e instanceof DOMException ||
+    NATIVE_ERROR_CONSTRUCTORS.has(e.constructor as ErrorConstructor);
+}
+
 export function serializeError(e: unknown): SerializedError {
   if (e instanceof Error) {
-    return { name: e.name, message: e.message, stack: e.stack };
+    const serialized: SerializedError = {
+      name: e.name,
+      message: e.message,
+      stack: e.stack,
+    };
+    if (isNativelyCloneableError(e)) {
+      try {
+        serialized.native = e;
+      } catch {
+        // The clone would fail on this runtime: drop the field, the manual
+        // name/message/stack still carry the error.
+      }
+    }
+    return serialized;
+  }
+  if (e instanceof DOMException) {
+    const serialized: SerializedError = { name: e.name, message: e.message };
+    try {
+      serialized.native = e;
+    } catch {
+      // same best-effort degradation
+    }
+    return serialized;
   }
   return { name: "Error", message: String(e) };
 }
 
 /** Error rebuilt on the main thread: keeps the worker's name/message/stack, instanceof Error. */
 export class RemoteError extends Error {
+  /**
+   * The structured-clone of the original error, when the worker attached one
+   * (built-in Error subclasses / DOMException). Use it for instanceof checks
+   * and DOMException.code; fall back to `name` otherwise.
+   */
+  readonly inner: Error | DOMException | undefined;
+
   constructor(serialized: SerializedError) {
     super(serialized.message);
     this.name = serialized.name;
     if (serialized.stack) this.stack = serialized.stack;
+    this.inner = serialized.native;
   }
 }
 

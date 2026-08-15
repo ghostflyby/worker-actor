@@ -391,7 +391,13 @@ type Frame =
   uniformly as `{name, message, stack}`, rebuilt on the main thread as
   `RemoteError` (instanceof Error, keeps worker name/stack) — consistent across
   implementations and extensible to cause/code fields; a contrast to "Actor
-  exceptions don't propagate back" — here they do, explicitly.
+  exceptions don't propagate back" — here they do, explicitly. For **known
+  natively-cloneable types** (built-in Error subclasses and DOMException) the
+  original error is additionally structured-cloned into `native`, exposed as
+  `RemoteError.inner` — restoring instanceof identity and `DOMException.code`.
+  Custom subclasses and errors with custom properties stay manual-only (their
+  clone would degrade, so it adds nothing); the clone is best-effort and dropped
+  if it would fail, the manual fields always carry the error.
 - **Death detection**: `onerror` / `onmessageerror` / handshake timeout /
   dispose all enter the dead state; in-flight calls reject with
   `ActorDiedError`, later calls are rejected immediately. `SpawnOptions.onDeath`

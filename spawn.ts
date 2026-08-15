@@ -44,8 +44,10 @@ type Resolved<T> = T extends Promise<unknown> ? Awaited<T> : T;
  *     at compile time.
  */
 export type Remote<T> = {
-  [K in keyof T]: T[K] extends (...args: infer A) => AsyncIterable<infer E>
-    ? (...args: A) => AsyncIterable<E>
+  [K in keyof T]: T[K] extends (...args: infer A) => never
+    ? (...args: A) => Promise<never> // never-returning (throwing) methods: never matches AsyncIterable
+    : T[K] extends (...args: infer A) => AsyncIterable<infer E>
+      ? (...args: A) => AsyncIterable<E>
     : T[K] extends RpcFn ? (
         ...args: TransformCallbacks<Parameters<T[K]>>
       ) => Promise<Resolved<ReturnType<T[K]>>>

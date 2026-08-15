@@ -44,6 +44,16 @@ export const rpc = {
     return a / b;
   },
 
+  /** Throws a DOMException: the RemoteError.inner clone keeps instanceof + code. */
+  throwDom(): never {
+    throw new DOMException("bad state", "InvalidStateError");
+  },
+
+  /** Throws a custom Error subclass: not natively cloneable, no inner attached. */
+  throwCustomSub(): never {
+    throw new SubError("custom subclass boom");
+  },
+
   /** Delayed side effect: proves concurrent calls correlate to the right ids. */
   async delay(ms: number, tag: string): Promise<string> {
     await new Promise((r) => setTimeout(r, ms));
@@ -242,5 +252,13 @@ export const rpc = {
 };
 
 let heldCallback: RemoteCallback<[number], number> | undefined;
+
+/** A custom Error subclass (not natively cloneable). */
+class SubError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SubError";
+  }
+}
 
 serveWorker(rpc);
