@@ -236,9 +236,18 @@ Lifecycle matches remote-ref: explicit `dispose()`, GC-based release
 channel). Callbacks are **behavior, not identity**: there is no refId, hand-off,
 or restore — and a callback reference cannot be re-encoded (encoding one fails
 loudly, since a proxy holder must not re-route the owner connection to a third
-party). Types stay ordinary: the worker writes `(x: number) => number` and the
-calling side passes a raw function; `RemoteCallback<A, R>` and `Callback<A, R>`
-are optional annotation helpers.
+party).
+
+**Declaring callback parameters** (avoiding type/runtime mismatch): at runtime a
+callback reference always returns a Promise, regardless of how the caller wrote
+the function. The honest declaration is therefore the `Callback<A, R>` helper —
+`(...args: A) => R | Promise<R>` — which accepts BOTH sync and async functions
+from the caller while keeping the worker body type-safe: `await cb(x)` types as
+`R`, and using `cb(x)` as a value is rejected by the compiler. Declaring a
+narrower signature (e.g. `(x) => number`) forces the caller to a matching shape
+but lets the worker body treat `cb(x)` as a value that is actually a Promise — a
+latent mismatch. `Callback<A, R>` is the recommended default; `RemoteCallback`
+is the reference type.
 
 ### Channel abstraction for custom protocols
 

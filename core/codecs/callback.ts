@@ -54,10 +54,19 @@ export type RemoteCallback<A extends unknown[] = unknown[], R = unknown> =
   & ((...args: A) => Promise<Awaited<R>>)
   & { dispose(): Promise<void> };
 
-/** Type helper for worker-side signatures: a plain function, travelable byref. */
+/**
+ * Type helper for worker-side callback parameters: a plain function whose
+ * return value may be a value or a Promise of it (`R | Promise<R>`).
+ *
+ * Declaring a callback as `Callback<A, R>` makes the CALLING side accept both
+ * sync and async functions, while the worker body stays honest: `await cb(x)`
+ * types as `R`, and using `cb(x)` as a value is rejected by the compiler
+ * (it is `R | Promise<R>`). This mirrors the runtime exactly — the callback
+ * reference always returns a Promise regardless of how the caller wrote it.
+ */
 export type Callback<A extends unknown[] = unknown[], R = unknown> = (
   ...args: A
-) => R;
+) => R | Promise<R>;
 
 interface CallbackHandle {
   [CODEC_PLACEHOLDER_KEY]: "callback";
