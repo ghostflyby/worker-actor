@@ -251,14 +251,12 @@ party).
 
 **Declaring callback parameters** (avoiding type/runtime mismatch): at runtime a
 callback reference always returns a Promise, regardless of how the caller wrote
-the function. The honest declaration is therefore the `Callback<A, R>` helper —
-`(...args: A) => R | Promise<R>` — which accepts BOTH sync and async functions
-from the caller while keeping the worker body type-safe: `await cb(x)` types as
-`R`, and using `cb(x)` as a value is rejected by the compiler. Declaring a
-narrower signature (e.g. `(x) => number`) forces the caller to a matching shape
-but lets the worker body treat `cb(x)` as a value that is actually a Promise — a
-latent mismatch. `Callback<A, R>` is the recommended default; `RemoteCallback`
-is the reference type.
+the function. Declare the honest form — `cb: (x) => Promise<R>` (or async) — and
+let `TransformCallbacks` (applied at the `Remote<T>` projection) widen the
+caller-facing shape to `R | Promise<R>`, so BOTH sync and async functions can be
+passed while the worker body stays type-safe: `await cb(x)` types as `R`, and
+using `cb(x)` as a value is rejected by the compiler. No separate helper type is
+needed; `RemoteCallback` remains the reference type.
 
 ### Channel abstraction for custom protocols
 

@@ -1,6 +1,6 @@
 /** Example worker: the exported rpc object is the Actor's API surface. */
 import { serveWorker } from "../../worker_runtime.ts";
-import type { Callback, RemoteCallback } from "../../core/codecs/callback.ts";
+import type { RemoteCallback } from "../../core/codecs/callback.ts";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -179,18 +179,6 @@ export const rpc = {
     // flattens it. The worker writes it as an ordinary function — that is the
     // point of automatic byref.
     return Promise.resolve(cb(21));
-  },
-
-  /**
-   * Recommended callback declaration: `Callback<A, R>` (return `R | Promise<R>`)
-   * accepts BOTH sync and async functions from the caller, while the worker
-   * body stays honest — `await cb(x)` types as R.
-   */
-  callWithCallback(cb: Callback<[number], number>): Promise<number> {
-    return (async () => {
-      const v = await cb(5); // v: number (honest: awaited)
-      return v + 1;
-    })();
   },
 
   /** Async callback: result is awaited across the channel. */

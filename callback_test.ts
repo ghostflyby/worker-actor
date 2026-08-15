@@ -41,18 +41,6 @@ Deno.test("callback: async callback result is awaited across the channel", async
   await actor.dispose();
 });
 
-Deno.test("callback: Callback<R|Promise<R>> accepts both sync and async callers", async () => {
-  const actor = await makeActor();
-  // sync caller
-  assertEquals(await actor.callWithCallback((x: number) => x * 2), 11);
-  // async caller
-  assertEquals(
-    await actor.callWithCallback(async (x: number) => (await sleep(1), x * 3)),
-    16,
-  );
-  await actor.dispose();
-});
-
 Deno.test("callback: Promise-declared parameter accepts sync callers via TransformCallbacks", async () => {
   const actor = await makeActor();
   // callAsyncCallback declares cb: (x: string) => Promise<string>. Through the

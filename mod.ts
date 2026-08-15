@@ -26,7 +26,7 @@ export { createErrorCodec, errorCodec } from "./core/codecs/error.ts";
 export type { ErrorCodecOptions } from "./core/codecs/error.ts";
 export { abortSignalCodec } from "./core/codecs/abort_signal.ts";
 export { callbackCodec } from "./core/codecs/callback.ts";
-export type { Callback, RemoteCallback } from "./core/codecs/callback.ts";
+export type { RemoteCallback } from "./core/codecs/callback.ts";
 
 // —— High-level channel abstraction for codec authors ——
 export {
