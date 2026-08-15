@@ -74,8 +74,9 @@ await actor.dispose();
 export type Remote<T> = {
   [K in keyof T]: T[K] extends (...args: infer A) => AsyncIterable<infer E>
     ? (...args: A) => AsyncIterable<E>
-    : T[K] extends RpcFn
-      ? (...args: Parameters<T[K]>) => Promise<Resolved<ReturnType<T[K]>>>
+    : T[K] extends RpcFn ? (
+        ...args: TransformCallbacks<Parameters<T[K]>>
+      ) => Promise<Resolved<ReturnType<T[K]>>>
     : never;
 };
 ```
@@ -90,6 +91,16 @@ export type Remote<T> = {
   generator only runs after the first `start` frame). An explicit
   `Promise<AsyncIterable<E>>` keeps its eager Promise — the writer spelled that
   intent out, so it is not flattened.
+- **Callback parameters are projected through `TransformCallbacks`** (the single
+  type-projection point, `core/type-utils.ts`): a worker declaring
+  `cb: (x) => Promise<R>` keeps its honest runtime shape, while the CALLING side
+  may pass a sync or an async function (`R | Promise<R>`) — top-level
+  parameters, nested object fields and array elements all widen
+  deep-recursively. Built-in containers (Map/Set/Date/AsyncIterable/Promise/
+  ArrayBuffer/views) pass through unchanged, and predicate/edge function shapes
+  are preserved, so `Codec.matches` and friends are never mapped into empty
+  objects. The worker-side declaration is untouched; only the caller-facing
+  parameter type changes.
 - Return values are normalized to Promise; single-parameter `Promise`
   (`Awaited`) flattens automatically, no recursive types.
 - Callers always write `spawn<typeof WorkerModule.rpc>` and never a second

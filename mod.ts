@@ -20,6 +20,7 @@ export {
 export type { Codec, DecodeContext, EncodeContext } from "./core/codec.ts";
 export { createRpcProxy, makeRpcHandler } from "./core/rpc.ts";
 export type { PeerRpc, RpcApi } from "./core/rpc.ts";
+export type { SyncOrAsync, TransformCallbacks } from "./core/type-utils.ts";
 export { iterableCodec } from "./core/codecs/iterable.ts";
 export { createErrorCodec, errorCodec } from "./core/codecs/error.ts";
 export type { ErrorCodecOptions } from "./core/codecs/error.ts";

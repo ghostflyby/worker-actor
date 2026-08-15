@@ -14,6 +14,7 @@
 import { ActorDiedError, Frame, PROTOCOL_VERSION } from "./core/protocol.ts";
 import { type Codec, PayloadCodecRegistry } from "./core/codec.ts";
 import { createRpcProxy } from "./core/rpc.ts";
+import type { TransformCallbacks } from "./core/type-utils.ts";
 import { iterableCodec } from "./core/codecs/iterable.ts";
 import { errorCodec } from "./core/codecs/error.ts";
 import { abortSignalCodec } from "./core/codecs/abort_signal.ts";
@@ -35,15 +36,19 @@ type Resolved<T> = T extends Promise<unknown> ? Awaited<T> : T;
  *     first next() triggers the remote call);
  *   - an explicit Promise<AsyncIterable<E>> keeps its eager Promise (await
  *     works), because the writer spelled out that intent;
- *   - every other function member returns a Promise;
+ *   - every other function member returns a Promise. Parameter types are
+ *     projected through TransformCallbacks: a Promise-returning function
+ *     parameter (the worker's honest declaration) widens to `R | Promise<R>`
+ *     on the calling side, so BOTH sync and async functions can be passed;
  *   - non-function members (constants, classes, ...) resolve to never and fail
  *     at compile time.
  */
 export type Remote<T> = {
   [K in keyof T]: T[K] extends (...args: infer A) => AsyncIterable<infer E>
     ? (...args: A) => AsyncIterable<E>
-    : T[K] extends RpcFn
-      ? (...args: Parameters<T[K]>) => Promise<Resolved<ReturnType<T[K]>>>
+    : T[K] extends RpcFn ? (
+        ...args: TransformCallbacks<Parameters<T[K]>>
+      ) => Promise<Resolved<ReturnType<T[K]>>>
     : never;
 };
 

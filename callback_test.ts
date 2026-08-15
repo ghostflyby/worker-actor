@@ -53,6 +53,22 @@ Deno.test("callback: Callback<R|Promise<R>> accepts both sync and async callers"
   await actor.dispose();
 });
 
+Deno.test("callback: Promise-declared parameter accepts sync callers via TransformCallbacks", async () => {
+  const actor = await makeActor();
+  // callAsyncCallback declares cb: (x: string) => Promise<string>. Through the
+  // Remote<T> projection (TransformCallbacks) the calling side may pass a SYNC
+  // function — the worker still awaits it and gets the value.
+  const syncResult = await actor.callAsyncCallback((s: string) => `${s} sync`);
+  assertEquals(syncResult, "hello sync");
+  // and async callers keep working as before
+  const asyncResult = await actor.callAsyncCallback(async (s: string) => {
+    await sleep(1);
+    return `${s} async`;
+  });
+  assertEquals(asyncResult, "hello async");
+  await actor.dispose();
+});
+
 Deno.test("callback: async callback rejection surfaces as RemoteError at the worker's await", async () => {
   const actor = await makeActor();
   const outcome = await actor.callAsyncRejectingCallback(async (x: number) => {
