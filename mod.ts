@@ -1,6 +1,8 @@
 /** A library that wraps Web Workers into type-safe Actors. */
-export { link, spawn } from "./spawn.ts";
+export { attachLazyIterator, link, spawn } from "./spawn.ts";
 export type { ActorHandle, Remote, SpawnOptions } from "./spawn.ts";
+export { createActorPool } from "./pool.ts";
+export type { ActorPool, ActorPoolOptions } from "./pool.ts";
 export { serveWorker } from "./worker_runtime.ts";
 export type {
   LinkHandle,

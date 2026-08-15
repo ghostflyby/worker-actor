@@ -231,6 +231,14 @@ export const rpc = {
   returnHeld(): (x: number) => number {
     return heldCallback as unknown as (x: number) => number;
   },
+  /** Deliberately crash this worker (uncaught exception) — used by pool tests. */
+  crash(): never {
+    // fire an uncaught error asynchronously so the response never arrives
+    queueMicrotask(() => {
+      throw new Error("intentional worker crash");
+    });
+    return undefined as never;
+  },
 };
 
 let heldCallback: RemoteCallback<[number], number> | undefined;

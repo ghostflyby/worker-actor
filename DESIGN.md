@@ -394,7 +394,36 @@ type Frame =
   exceptions don't propagate back" — here they do, explicitly.
 - **Death detection**: `onerror` / `onmessageerror` / handshake timeout /
   dispose all enter the dead state; in-flight calls reject with
-  `ActorDiedError`, later calls are rejected immediately.
+  `ActorDiedError`, later calls are rejected immediately. `SpawnOptions.onDeath`
+  fires on the kill path (crash / handshake failure / interrupted creation) but
+  NOT on dispose — the only way to observe a crash, since spawn owns the
+  worker's onerror/onmessage handlers.
+
+## Actor pooling
+
+`createActorPool<T>(options)` is a **lightweight combinator**, not a task
+scheduler: it takes a homogeneous set of Workers (same factory, same RPC
+surface) and exposes one typed call surface (`Remote<T>`) that routes each call
+to a member — picking a member, calling its spawn proxy (the same
+`createRpcProxy` path), and tracking liveness. No queue, no work-stealing.
+
+- Routing: `"round-robin"` (default) / `"least-busy"` (fewest in-flight) / a
+  custom `(method, args) => index` function (validated; must target a live
+  member). All members dead → calls reject with `ActorDiedError`.
+- Member lifecycle: spawn's `onDeath` marks the member dead, drops it from
+  routing, fires `onMemberDead(index, reason)`, and — when `replace` is set
+  (boolean or a factory) — rebuilds it. `dispose()` terminates every member
+  (idempotent).
+- Member-bound payloads (documented constraint): plain data routes freely; a
+  main-thread-created callback routes to any member (it executes on the main
+  thread regardless of holder); fresh object-reference tokens (remote-ref) route
+  anywhere, but a refId-only (moved) token must not cross members — use
+  `invokeOn(index, method, args)` to pin the owning member; streams bind to the
+  producing member's lifetime and are consumed by the caller, never re-routed.
+  Stream-returning methods stay lazy through the pooled proxy
+  (`attachLazyIterator` is applied to pooled calls, same as spawn).
+- `size` reports live members; the pool is usable immediately, before any
+  member's handshake completes (calls wait for the first ready member).
 
 ## Lifecycle
 

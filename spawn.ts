@@ -67,13 +67,67 @@ export interface SpawnOptions {
   signal?: AbortSignal | null;
   /**
    * Extra codecs to register, matched before the built-ins.
-   * Built-ins: iterable / error / abort-signal. Both sides must register the
-   * same tag list; the handshake validates it and a mismatch kills the actor.
+   * Built-ins: iterable / error / abort-signal / callback. Both sides must
+   * register the same tag list; the handshake validates it and a mismatch
+   * kills the actor.
    */
   codecs?: Codec<unknown>[];
+  /**
+   * Fired when the actor dies through the kill() path: a worker crash, a
+   * handshake failure (version/codec mismatch, timeout, interrupted creation).
+   * NOT fired by dispose() — a deliberate shutdown is not a death. The pool
+   * uses this to remove/replace a member; spawn's own onerror/onmessage
+   * handlers are assigned internally, so this is the only way to observe a
+   * crash without breaking spawn.
+   */
+  onDeath?: (reason: unknown) => void;
 }
 
 const HANDSHAKE_TIMEOUT = 10_000;
+
+/**
+ * Make a stream-returning method's promise directly consumable via `for await`
+ * (the Remote<T> special case types it as AsyncIterable<E>). The promise stays
+ * a real promise (await/.catch/.finally all work); the attached iterator
+ * resolves it on the first next() and forwards the inner remote iterable.
+ * Element-level laziness is preserved by the iterable codec itself: the
+ * worker-side generator only runs after the first next() (the start frame).
+ *
+ * Exported so an actor pool (which reuses the Remote<T> shape) applies the
+ * same laziness to its routed calls.
+ */
+export function attachLazyIterator(p: Promise<unknown>): void {
+  let attached = false;
+  Object.defineProperty(p, Symbol.asyncIterator, {
+    configurable: true,
+    value() {
+      if (!attached) {
+        attached = true;
+        void p.catch(() => {}); // avoid unhandled rejection while awaiting later
+      }
+      let iterator: AsyncIterator<unknown> | undefined;
+      let started = false;
+      return {
+        async next(): Promise<IteratorResult<unknown>> {
+          if (!started) {
+            started = true;
+            const inner = await p as AsyncIterable<unknown>;
+            iterator = inner[Symbol.asyncIterator]();
+          }
+          return iterator!.next();
+        },
+        async return(value?: unknown): Promise<IteratorResult<unknown>> {
+          if (iterator) {
+            const r = iterator.return?.(value);
+            return r ? await r : { done: true, value };
+          }
+          // never started: the worker generator never ran, nothing to cancel
+          return { done: true, value };
+        },
+      };
+    },
+  });
+}
 
 /** Lifecycle methods attached to the proxy (not part of Remote<T> itself). */
 export interface ActorHandle {
@@ -203,54 +257,15 @@ export async function spawn<T>(
     // reject it so spawn() fails instead of hanging.
     rejectHandshake?.(reason);
     worker.terminate();
+    // Notify the owner (e.g. an actor pool) so it can remove/replace the member.
+    // Deliberately NOT fired by dispose(): a deliberate shutdown is not a death.
+    options.onDeath?.(reason);
   }
 
   // Always return a rejected promise, never throw synchronously:
   // await and .catch behave identically for callers.
   const invoke = (method: string, args: unknown[]): Promise<unknown> =>
     rpcProxy.call(method, args);
-
-  /**
-   * Make a stream-returning method directly consumable via `for await` (the
-   * Remote<T> special case types it as AsyncIterable<E>). The promise stays a
-   * real promise (await/.catch/.finally all work); the attached iterator
-   * resolves it on the first next() and forwards the inner remote iterable.
-   * Element-level laziness is preserved by the iterable codec itself: the
-   * worker-side generator only runs after the first next() (the start frame),
-   * so a method's side effects happen on first iteration either way.
-   */
-  function attachLazyIterator(p: Promise<unknown>): void {
-    let attached = false;
-    Object.defineProperty(p, Symbol.asyncIterator, {
-      configurable: true,
-      value() {
-        if (!attached) {
-          attached = true;
-          void p.catch(() => {}); // avoid unhandled rejection while awaiting later
-        }
-        let iterator: AsyncIterator<unknown> | undefined;
-        let started = false;
-        return {
-          async next(): Promise<IteratorResult<unknown>> {
-            if (!started) {
-              started = true;
-              const inner = await p as AsyncIterable<unknown>;
-              iterator = inner[Symbol.asyncIterator]();
-            }
-            return iterator!.next();
-          },
-          async return(value?: unknown): Promise<IteratorResult<unknown>> {
-            if (iterator) {
-              const r = iterator.return?.(value);
-              return r ? await r : { done: true, value };
-            }
-            // never started: the worker generator never ran, nothing to cancel
-            return { done: true, value };
-          },
-        };
-      },
-    });
-  }
 
   const dispose = (): Promise<void> => {
     if (dead) return Promise.resolve();
