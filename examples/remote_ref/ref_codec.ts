@@ -44,7 +44,6 @@ import {
   openChannel,
   registerRelease,
 } from "../../core/channel.ts";
-import { RefQueue } from "../../core/task-queue.ts";
 import { RemoteError, serializeError } from "../../core/protocol.ts";
 
 const REF_BRAND = Symbol.for("worker-actor-example.remote-ref");
@@ -142,55 +141,50 @@ function startRefOwner(
   obj: unknown,
   registry: EncodeContext["registry"],
 ): void {
-  // Per-reference serial queue: calls on this reference execute strictly one
-  // at a time (actor semantics); a call may suspend itself with actorYield().
-  const queue = new RefQueue();
-  channel.onMessage((message) => {
+  channel.onMessage(async (message) => {
     const frame = message as RefFrame;
     if (frame.type === "call") {
-      queue.enqueue(async () => {
-        const fn = (obj as Record<string, unknown>)[frame.method];
-        if (typeof fn !== "function") {
-          channel.send(
-            {
-              type: "result",
-              id: frame.id,
-              ok: false,
-              error: serializeError(
-                new Error(`No such method: "${frame.method}"`),
-              ),
-            } satisfies RefFrame,
-          );
-          return;
-        }
-        try {
-          // args arrive encoded (may contain nested streams/refs); decode them
-          const args = registry.decode(frame.args) as unknown[];
-          const value = await (fn as (...a: unknown[]) => unknown).apply(
-            obj,
-            args,
-          );
-          const transfer: Transferable[] = [];
-          channel.send(
-            {
-              type: "result",
-              id: frame.id,
-              ok: true,
-              value: registry.encode(value, transfer),
-            } satisfies RefFrame,
-            transfer,
-          );
-        } catch (e) {
-          channel.send(
-            {
-              type: "result",
-              id: frame.id,
-              ok: false,
-              error: serializeError(e),
-            } satisfies RefFrame,
-          );
-        }
-      });
+      const fn = (obj as Record<string, unknown>)[frame.method];
+      if (typeof fn !== "function") {
+        channel.send(
+          {
+            type: "result",
+            id: frame.id,
+            ok: false,
+            error: serializeError(
+              new Error(`No such method: "${frame.method}"`),
+            ),
+          } satisfies RefFrame,
+        );
+        return;
+      }
+      try {
+        // args arrive encoded (may contain nested streams/refs); decode them
+        const args = registry.decode(frame.args) as unknown[];
+        const value = await (fn as (...a: unknown[]) => unknown).apply(
+          obj,
+          args,
+        );
+        const transfer: Transferable[] = [];
+        channel.send(
+          {
+            type: "result",
+            id: frame.id,
+            ok: true,
+            value: registry.encode(value, transfer),
+          } satisfies RefFrame,
+          transfer,
+        );
+      } catch (e) {
+        channel.send(
+          {
+            type: "result",
+            id: frame.id,
+            ok: false,
+            error: serializeError(e),
+          } satisfies RefFrame,
+        );
+      }
     } else if (frame.type === "dispose") {
       // Optional cleanup hook on the real object (mirrors generator finally)
       (obj as { [Symbol.dispose]?: () => void })[Symbol.dispose]?.();

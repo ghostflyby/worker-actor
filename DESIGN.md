@@ -475,35 +475,6 @@ to a member — picking a member, calling its spawn proxy (the same
 | handshake timeout      | dead state, rejects with "did it call serveWorker()?"                                                       |
 | `Symbol.dispose`       | supports `using actor = ...` (TS 5.2+)                                                                      |
 
-## Per-ref serialization and actorYield
-
-Every reference address (a remote-ref object, a callback owner) now runs its
-calls through a **per-address serial queue** (`core/task-queue.ts`): one call at
-a time, and a call's segments never interleave with another call's segments on
-that address — the classic actor mailbox discipline, per reference. The main
-channel stays reentrant (the event loop's natural semantics), so only references
-opt into strict serialization.
-
-Long IO inside a serialized call would otherwise block the address, so
-`actorYield(p)` is the explicit escape hatch, callable from any worker method
-running inside a reference queue:
-
-- the current call's segment **completes and the queue releases** — the next
-  queued call on that reference starts immediately (the long wait never blocks
-  the address);
-- when `p` settles, the call is **re-queued** — its `actorYield` promise
-  resolves only when the queue serves it again;
-- the continuation after that resolve is a microtask: its _start_ is gated by
-  the queue, but once started it interleaves fairly with other calls' segments
-  (JS microtasks cannot be re-ordered) — the documented boundary of controlled
-  resumption.
-
-Outside a reference queue (a plain main-channel call), `actorYield` degrades to
-`await p` — the main channel is reentrant by design. Multiple yields inside one
-call work (each is a segment boundary; the call re-queues each time). Calls
-carrying an AsyncIterable block their reference's queue while the stream runs —
-split such calls with `actorYield` or use separate references.
-
 ## Known limitations
 
 - The worker handshake is **not buffered**: call `spawn()` right after

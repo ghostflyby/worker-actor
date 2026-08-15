@@ -18,7 +18,6 @@ export type { ActorHandle, Remote, SpawnOptions } from "./spawn.ts";
 export { createActorPool } from "./pool.ts";
 export type { ActorPool, ActorPoolOptions } from "./pool.ts";
 export { serveWorker } from "./worker_runtime.ts";
-export { actorYield } from "./actor_yield.ts";
 export type {
   LinkHandle,
   ServeWorkerOptions,
