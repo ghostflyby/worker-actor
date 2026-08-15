@@ -44,8 +44,18 @@ export type Remote<T> = {
 };
 
 export interface SpawnOptions {
-  /** Timeout waiting for the worker handshake (module load), default 10s. */
-  handshakeTimeoutMs?: number;
+  /**
+   * Interruption policy for creation (the handshake):
+   *   - omitted (undefined): default 10s timeout
+   *   - null: no interruption at all
+   *   - AbortSignal: creation is aborted when the signal fires; the rejection
+   *     reason is signal.reason (a TimeoutError from AbortSignal.timeout(n)
+   *     keeps the "did it call serveWorker()?" diagnostic)
+   * The signal only governs creation: after spawn() resolves, the actor's
+   * lifecycle is owned by dispose(). An already-aborted signal fails spawn()
+   * immediately.
+   */
+  signal?: AbortSignal | null;
   /**
    * Extra codecs to register, matched before the built-ins.
    * Built-ins: iterable / error / abort-signal. Both sides must register the
@@ -221,18 +231,40 @@ export async function spawn<T>(
     },
   });
 
-  // Handshake timeout: the worker never reported ready (module load failure or
-  // serveWorker() not called) — treat as dead.
-  const timer = setTimeout(() => {
-    kill(
-      new Error(
-        "Worker handshake timed out: the worker never reported ready " +
-          "(did it call serveWorker()?)",
-      ),
-    );
-  }, options.handshakeTimeoutMs ?? HANDSHAKE_TIMEOUT);
+  // Interruption for creation: undefined → default timeout, null → never,
+  // AbortSignal → user-controlled. A TimeoutError keeps the diagnostic hint
+  // for the most common failure (serveWorker() never called).
+  const interrupt = options.signal === undefined
+    ? AbortSignal.timeout(HANDSHAKE_TIMEOUT)
+    : options.signal;
+
+  const reasonOf = (r: unknown): unknown => {
+    if (r instanceof Error) {
+      if (r.name === "TimeoutError") {
+        return new Error(
+          "Worker handshake timed out: the worker never reported ready " +
+            "(did it call serveWorker()?)",
+        );
+      }
+      return r;
+    }
+    return new Error(String(r));
+  };
+
+  const onInterruptAbort = (): void => {
+    if (interrupt) kill(reasonOf(interrupt.reason));
+  };
+
+  if (interrupt?.aborted) {
+    kill(reasonOf(interrupt.reason));
+  } else {
+    interrupt?.addEventListener("abort", onInterruptAbort, { once: true });
+  }
 
   await handshake;
-  clearTimeout(timer);
+  // The signal only governs creation: drop the listener once resolved (a late
+  // TimeoutError must not kill a live actor). removeEventListener must receive
+  // the exact registered function.
+  interrupt?.removeEventListener("abort", onInterruptAbort);
   return actor;
 }

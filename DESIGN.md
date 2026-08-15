@@ -273,8 +273,16 @@ type Frame =
 
 - **The handshake frame** lets `spawn()` resolve only after the worker module is
   loaded and `serveWorker()` has run; it carries both sides' codec tag lists and
-  a mismatch kills the actor (timeout default 10s, configurable). Version/codec
-  mismatch or a worker crash rejects the handshake, so spawn() never hangs.
+  a mismatch kills the actor. Version/codec mismatch or a worker crash rejects
+  the handshake, so spawn() never hangs.
+- **Creation interruption is a three-state `signal` option** (not a bare
+  timeout): omitted → a default `AbortSignal.timeout(10s)`; `null` → no
+  interruption; an `AbortSignal` → user-controlled, and the rejection reason is
+  `signal.reason` (composable via `AbortSignal.any`, cancellable via a shared
+  controller, disabled by an idle signal). A `TimeoutError` reason keeps the
+  "did it call serveWorker()?" diagnostic. The signal governs creation only:
+  after resolve the listener is dropped and the actor's lifecycle belongs to
+  `dispose()`; an already-aborted signal fails spawn() immediately.
 - **Incrementing ids** correlate requests and responses; responses may arrive
   out of order. A single worker thread naturally processes requests serially,
   matching the Actor "one actor processes messages in order" semantics;
