@@ -13,6 +13,8 @@ async function accumulate(items: AsyncIterable<number>): Promise<number> {
 
 /** Times the main thread cancelled a stream: proves the generator finally runs in the worker on early stop. */
 let streamCancels = 0;
+/** How many stream bodies started iterating (laziness probe). */
+let streamStartCount = 0;
 
 export const rpc = {
   /** Plain numeric RPC. */
@@ -60,11 +62,35 @@ export const rpc = {
   /** Returns an AsyncIterable (return-value-side transport): pulled on demand by the main thread. */
   stream(prefix: string, n: number): AsyncIterable<string> {
     return (async function* () {
+      streamStartCount++; // body runs only once iteration starts (laziness probe)
       for (let i = 0; i < n; i++) {
         await sleep(5);
         yield `${prefix}-${i}`;
       }
     })();
+  },
+
+  /**
+   * Explicitly Promise-wrapped stream: Remote<T> keeps the Promise (eager
+   * intent spelled out by the writer), unlike the bare AsyncIterable above.
+   */
+  streamEager(n: number): Promise<AsyncIterable<number>> {
+    return Promise.resolve((async function* () {
+      for (let i = 0; i < n; i++) {
+        await sleep(5);
+        yield i;
+      }
+    })());
+  },
+
+  /** Laziness probe: how many stream bodies actually started iterating. */
+  streamStarts(): number {
+    return streamStartCount;
+  },
+
+  /** Stream whose creation throws: the error surfaces at first next() on the caller side. */
+  failingCreationStream(): AsyncIterable<number> {
+    throw new Error("stream creation failed");
   },
 
   /** Stream that throws mid-way: the error is rebuilt as RemoteError on the main thread. */

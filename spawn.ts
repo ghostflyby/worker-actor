@@ -29,13 +29,20 @@ type Resolved<T> = T extends Promise<unknown> ? Awaited<T> : T;
 
 /**
  * Derives the remote proxy type from the worker-side API shape:
- * only function members survive, and return values are wrapped in Promise.
- * Non-function members (constants, classes, ...) resolve to never and fail
- * at compile time.
+ *   - a method returning AsyncIterable<E> directly maps to () => AsyncIterable<E>
+ *     — the stream is its own async semantics, no Promise wrapper (lazy: the
+ *     first next() triggers the remote call);
+ *   - an explicit Promise<AsyncIterable<E>> keeps its eager Promise (await
+ *     works), because the writer spelled out that intent;
+ *   - every other function member returns a Promise;
+ *   - non-function members (constants, classes, ...) resolve to never and fail
+ *     at compile time.
  */
 export type Remote<T> = {
-  [K in keyof T]: T[K] extends RpcFn
-    ? (...args: Parameters<T[K]>) => Promise<Resolved<ReturnType<T[K]>>>
+  [K in keyof T]: T[K] extends (...args: infer A) => AsyncIterable<infer E>
+    ? (...args: A) => AsyncIterable<E>
+    : T[K] extends RpcFn
+      ? (...args: Parameters<T[K]>) => Promise<Resolved<ReturnType<T[K]>>>
     : never;
 };
 
@@ -190,6 +197,48 @@ export async function spawn<T>(
   const invoke = (method: string, args: unknown[]): Promise<unknown> =>
     rpcProxy.call(method, args);
 
+  /**
+   * Make a stream-returning method directly consumable via `for await` (the
+   * Remote<T> special case types it as AsyncIterable<E>). The promise stays a
+   * real promise (await/.catch/.finally all work); the attached iterator
+   * resolves it on the first next() and forwards the inner remote iterable.
+   * Element-level laziness is preserved by the iterable codec itself: the
+   * worker-side generator only runs after the first next() (the start frame),
+   * so a method's side effects happen on first iteration either way.
+   */
+  function attachLazyIterator(p: Promise<unknown>): void {
+    let attached = false;
+    Object.defineProperty(p, Symbol.asyncIterator, {
+      configurable: true,
+      value() {
+        if (!attached) {
+          attached = true;
+          void p.catch(() => {}); // avoid unhandled rejection while awaiting later
+        }
+        let iterator: AsyncIterator<unknown> | undefined;
+        let started = false;
+        return {
+          async next(): Promise<IteratorResult<unknown>> {
+            if (!started) {
+              started = true;
+              const inner = await p as AsyncIterable<unknown>;
+              iterator = inner[Symbol.asyncIterator]();
+            }
+            return iterator!.next();
+          },
+          async return(value?: unknown): Promise<IteratorResult<unknown>> {
+            if (iterator) {
+              const r = iterator.return?.(value);
+              return r ? await r : { done: true, value };
+            }
+            // never started: the worker generator never ran, nothing to cancel
+            return { done: true, value };
+          },
+        };
+      },
+    });
+  }
+
   const dispose = (): Promise<void> => {
     if (dead) return Promise.resolve();
     dead = true;
@@ -210,7 +259,11 @@ export async function spawn<T>(
       // The proxy must not be detected as a thenable, or await behavior breaks.
       if (prop === "then") return undefined;
       if (typeof prop === "string") {
-        return (...args: unknown[]) => invoke(prop, args);
+        return (...args: unknown[]) => {
+          const p = invoke(prop, args);
+          attachLazyIterator(p);
+          return p;
+        };
       }
       return undefined;
     },

@@ -72,14 +72,24 @@ await actor.dispose();
 
 ```ts
 export type Remote<T> = {
-  [K in keyof T]: T[K] extends RpcFn
-    ? (...args: Parameters<T[K]>) => Promise<Resolved<ReturnType<T[K]>>>
+  [K in keyof T]: T[K] extends (...args: infer A) => AsyncIterable<infer E>
+    ? (...args: A) => AsyncIterable<E>
+    : T[K] extends RpcFn
+      ? (...args: Parameters<T[K]>) => Promise<Resolved<ReturnType<T[K]>>>
     : never;
 };
 ```
 
 - Only function members survive; non-function members resolve to `never` (a
   mistyped field fails immediately at compile time).
+- A method returning `AsyncIterable<E>` maps to `() => AsyncIterable<E>` — the
+  stream is its own async semantics, so the outer Promise is dropped. The call
+  stays a real promise underneath (await/.catch work); its attached iterator
+  resolves it on the first `next()` and forwards the inner remote stream.
+  Element-level laziness is preserved by the iterable codec (the worker-side
+  generator only runs after the first `start` frame). An explicit
+  `Promise<AsyncIterable<E>>` keeps its eager Promise — the writer spelled that
+  intent out, so it is not flattened.
 - Return values are normalized to Promise; single-parameter `Promise`
   (`Awaited`) flattens automatically, no recursive types.
 - Callers always write `spawn<typeof WorkerModule.rpc>` and never a second
