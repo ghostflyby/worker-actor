@@ -43,7 +43,11 @@ export type Frame =
   }
   | { type: "response"; id: number; ok: false; error: SerializedError }
   /** Main thread → worker: graceful shutdown; the worker calls self.close() on receipt. */
-  | { type: "dispose" };
+  | { type: "dispose" }
+  /** Worker-runtime internal: establish a direct link channel between two workers (label-scoped). */
+  | { type: "__link"; label: string; port: MessagePort }
+  /** Worker-runtime internal: tear down a link channel by label. */
+  | { type: "__link-close"; label: string };
 
 export function serializeError(e: unknown): SerializedError {
   if (e instanceof Error) {

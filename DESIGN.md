@@ -225,6 +225,38 @@ dedicated channel, errors serialized back, dispose/GC release, nested streams
 flowing through reference results). It is an example, not a built-in — the
 library stays protocol-agnostic.
 
+### Direct worker-to-worker links
+
+A worker cannot talk to another worker directly (DedicatedWorker has no peer
+addressing), so the main thread bootstraps a link — but never relays its
+contents. `link(workerB, workerC, label)` opens a MessageChannel and transfers
+one port into each worker as a `__link` control frame (the frames live on the
+main RPC channel; the link itself is a separate channel). Each worker's
+`serveWorker` exposes the link via `onLink`:
+
+- `link.send(value)` — send any codec value to the peer. Encoding runs through
+  the sender's registry, so the payload may be a remote reference, a stream, an
+  AbortSignal, or plain structured-cloneable data. The main thread never sees
+  the value.
+- `link.onValue(handler)` — receive decoded values from the peer.
+- `link.close()` / `unlink()` — tear the link down; failAll also closes every
+  open link when an actor dies.
+
+This enables A→B→C topologies without A in the data path: worker B hands a
+reference to an object it owns directly to worker C over the link, and C calls
+it — the reference channel runs between B and C only. The link is
+**bidirectional**, so C can hand its own objects back to B. A peer-death
+detection is best-effort (MessagePort has no close event; a closed channel
+surfaces as send errors / delivery failure), recorded as a limitation.
+
+Constraints: both link endpoints must register a compatible codec set for the
+values they exchange (a mismatch fails loudly on decode, like the RPC
+handshake); only fresh tokens can be transmitted — a received reference proxy is
+not re-encodable (references are owned by their creator, mirroring the ActorRef
+semantics of "references cannot be serialized"). Direct RPC between linked
+workers (reusing request/response frames on the link) is a planned next step,
+not implemented yet.
+
 **Functions/closures are not codec-ified**: that would violate structured-clone
 semantics; `Remote<T>` already treats functions as RPC methods, not data.
 
@@ -270,6 +302,10 @@ type Frame =
 
 ## Known limitations
 
+- The worker handshake is **not buffered**: call `spawn()` right after
+  `new Worker(...)`. If messages arrive before the handler is set (e.g. another
+  await in between), the handshake is lost and spawn() waits until the handshake
+  timeout.
 - One RPC entry object per worker module (extendable to
   `serveWorker({ ns: { … } })` namespaces).
 - If `worker.postMessage` throws `DataCloneError` (e.g. a function/class

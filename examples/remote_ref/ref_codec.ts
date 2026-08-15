@@ -35,6 +35,8 @@ import {
 import { RemoteError, serializeError } from "../../core/protocol.ts";
 
 const REF_BRAND = Symbol.for("worker-actor-example.remote-ref");
+/** Marks the receiving-side proxy; lets a peer detect "this is a reference, not a value". */
+const REF_PROXY_BRAND = Symbol.for("worker-actor-example.remote-ref.proxy");
 
 /** The proxy type: every method returns a Promise; non-functions are `never`. */
 export type RemoteRef<T> =
@@ -44,6 +46,12 @@ export type RemoteRef<T> =
       : never;
   }
   & { dispose(): Promise<void> };
+
+/** Brand check: is this a remote reference proxy (a marshaled reference), as opposed to a plain value? */
+export function isRemoteRef(v: unknown): v is RemoteRef<unknown> {
+  return typeof v === "object" && v !== null &&
+    (v as { [REF_PROXY_BRAND]?: unknown })[REF_PROXY_BRAND] === true;
+}
 
 /** Transmittable token produced by remoteRef(); recognized by the codec. */
 interface RefToken {
@@ -193,6 +201,7 @@ function createRefProxy(
 
   const proxy = new Proxy({} as RemoteRef<unknown>, {
     get(_target, prop) {
+      if (prop === REF_PROXY_BRAND) return true;
       if (prop === "dispose") return dispose;
       if (prop === Symbol.dispose) return () => void dispose();
       // The proxy must not be detected as a thenable, or await behavior breaks.

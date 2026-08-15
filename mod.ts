@@ -1,8 +1,12 @@
 /** A library that wraps Web Workers into type-safe Actors. */
-export { spawn } from "./spawn.ts";
+export { link, spawn } from "./spawn.ts";
 export type { ActorHandle, Remote, SpawnOptions } from "./spawn.ts";
 export { serveWorker } from "./worker_runtime.ts";
-export type { ServeWorkerOptions, WorkerApi } from "./worker_runtime.ts";
+export type {
+  LinkHandle,
+  ServeWorkerOptions,
+  WorkerApi,
+} from "./worker_runtime.ts";
 export { ActorDiedError, RemoteError } from "./core/protocol.ts";
 export type { Frame, SerializedError } from "./core/protocol.ts";
 export { createRemoteIterable, startStreamProducer } from "./core/stream.ts";

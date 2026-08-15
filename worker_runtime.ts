@@ -19,6 +19,7 @@
 
 import { Frame, PROTOCOL_VERSION, serializeError } from "./core/protocol.ts";
 import { type Codec, PayloadCodecRegistry } from "./core/codec.ts";
+import { type Channel, connectChannel } from "./core/channel.ts";
 import { iterableCodec } from "./core/codecs/iterable.ts";
 import { errorCodec } from "./core/codecs/error.ts";
 import { abortSignalCodec } from "./core/codecs/abort_signal.ts";
@@ -39,6 +40,28 @@ export interface WorkerApi {
   [method: string]: (...args: any[]) => any;
 }
 
+/** A direct, bidirectional link between this worker and a peer worker. */
+export interface LinkHandle {
+  /** Label of the link (shared by both endpoints). */
+  label: string;
+  /**
+   * Send any codec value to the peer: references, streams, AbortSignals and
+   * plain structured-cloneable values all work. Encoding runs through this
+   * worker's registry, so the peer must register a compatible codec set.
+   */
+  send(value: unknown): void;
+  /** Register the handler for values arriving from the peer (last handler wins). */
+  onValue(handler: (value: unknown) => void): void;
+  /** Close this endpoint of the link; idempotent. */
+  close(): void;
+}
+
+/** Frame carried on a link channel (not on the main RPC channel). */
+interface LinkValueFrame {
+  type: "__link-value";
+  value: unknown;
+}
+
 export interface ServeWorkerOptions {
   /**
    * Extra codecs to register, matched before the built-ins.
@@ -46,6 +69,13 @@ export interface ServeWorkerOptions {
    * spawn()'s; the handshake frame carries and validates it.
    */
   codecs?: Codec<unknown>[];
+  /**
+   * Called when the main thread links this worker to a peer via link().
+   * The handle exposes send/onValue over a direct channel that bypasses the
+   * main thread; the peer must register a compatible codec set for the values
+   * sent over it. Link channels are closed by failAll when the actor dies.
+   */
+  onLink?: (link: LinkHandle) => void;
 }
 
 export function serveWorker(
@@ -59,6 +89,7 @@ export function serveWorker(
     if (!registry.has(codec.tag)) registry.register(codec);
   }
   const post = (frame: Frame) => self.postMessage(frame);
+  const links = new Map<string, Channel>();
 
   self.onmessage = async (ev: MessageEvent<Frame>) => {
     const frame = ev.data;
@@ -98,6 +129,47 @@ export function serveWorker(
           error: serializeError(e),
         });
       }
+      return;
+    }
+    if (frame.type === "__link") {
+      // Direct link to a peer worker, bypassing the main thread. Values sent on
+      // it are encoded/decoded through this worker's registry, so a reference
+      // handed over the link is owned by this worker and called by the peer.
+      const channel = connectChannel(frame.port);
+      registry.registerChannel(channel); // failAll closes every open link too
+      links.set(frame.label, channel);
+      let valueHandler: ((value: unknown) => void) | undefined;
+      channel.onMessage((message) => {
+        const linkFrame = message as LinkValueFrame;
+        if (linkFrame.type === "__link-value") {
+          valueHandler?.(registry.decode(linkFrame.value));
+        }
+      });
+      options.onLink?.({
+        label: frame.label,
+        send(value: unknown): void {
+          const transfer: Transferable[] = [];
+          channel.send(
+            {
+              type: "__link-value",
+              value: registry.encode(value, transfer),
+            } satisfies LinkValueFrame,
+            transfer,
+          );
+        },
+        onValue(handler: (value: unknown) => void): void {
+          valueHandler = handler;
+        },
+        close(): void {
+          channel.close();
+          links.delete(frame.label);
+        },
+      });
+      return;
+    }
+    if (frame.type === "__link-close") {
+      links.get(frame.label)?.close();
+      links.delete(frame.label);
       return;
     }
     if (frame.type === "dispose") {

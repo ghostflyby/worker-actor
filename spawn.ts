@@ -67,10 +67,37 @@ export interface ActorHandle {
   dispose(): Promise<void>;
 }
 
+/**
+ * Establish a direct, bidirectional link channel between two workers, bypassing
+ * the main thread. Values sent over the link are encoded/decoded through each
+ * worker's own codec registry, so references and streams hand directly between
+ * the two workers without the main thread in the path. Both workers must expose
+ * the link via serveWorker's onLink option (and register compatible codecs).
+ *
+ * Returns a tear-down function that tells both workers to close the link.
+ */
+export function link(a: Worker, b: Worker, label: string): () => void {
+  const { port1, port2 } = new MessageChannel();
+  a.postMessage({ type: "__link", label, port: port1 } satisfies Frame, {
+    transfer: [port1],
+  });
+  b.postMessage({ type: "__link", label, port: port2 } satisfies Frame, {
+    transfer: [port2],
+  });
+  return () => {
+    a.postMessage({ type: "__link-close", label } satisfies Frame);
+    b.postMessage({ type: "__link-close", label } satisfies Frame);
+  };
+}
+
 export async function spawn<T>(
   worker: Worker,
   options: SpawnOptions = {},
 ): Promise<Remote<T> & ActorHandle> {
+  // Constraint: the worker handshake is not buffered — call spawn() right after
+  // `new Worker(...)`. If messages arrive before the onmessage handler below is
+  // set (e.g. another await in between), the handshake is lost and spawn()
+  // waits until the handshake timeout.
   const pending = new Map<number, PendingCall>();
   const registry = new PayloadCodecRegistry();
   // User codecs register first (can override a built-in of the same tag); built-ins fill in after.
