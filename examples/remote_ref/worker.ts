@@ -44,7 +44,28 @@ const shared = new Counter();
 
 export const rpc = {
   createCounter(): RemoteRef<Counter> {
-    return remoteRef(new Counter());
+    // Mode 1: the worker holds the object, so it stays alive regardless of
+    // references. The counter's [Symbol.dispose] runs on ref dispose/GC.
+    const c = new Counter();
+    heldObjects.push(c);
+    return remoteRef(c);
+  },
+  /** Mode 2: the object is only reachable through its reference — it dies
+   *  once the worker's reference graph drops it (remote holders don't pin it).
+   *  GC probe: how many ephemeral objects were collected. */
+  createEphemeral(): RemoteRef<Counter> {
+    const c = new Counter();
+    ephemeralFinalizer.register(c, undefined);
+    return remoteRef(c);
+  },
+  /** How many ephemeral objects were garbage-collected (release probe). */
+  ephemeralFinalized(): number {
+    return ephemeralFinalizedCount;
+  },
+  /** Drop all held objects: mode-1 references now point at released objects. */
+  releaseAllHeld(): string {
+    heldObjects.length = 0;
+    return "released";
   },
   sharedCounter(): RemoteRef<Counter> {
     return remoteRef(shared);
@@ -81,5 +102,10 @@ export const rpc = {
 };
 
 let heldRef: RemoteRef<unknown> | undefined;
+const heldObjects: object[] = [];
+let ephemeralFinalizedCount = 0;
+const ephemeralFinalizer = new FinalizationRegistry<void>(() => {
+  ephemeralFinalizedCount++;
+});
 
 serveWorker(rpc, { codecs: [remoteRefCodec] });

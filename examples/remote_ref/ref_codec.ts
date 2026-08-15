@@ -100,8 +100,12 @@ let workerIdPrefix = Math.random().toString(36).slice(2);
 const refIdByObj = new WeakMap<object, string>();
 const objByRefId = new Map<string, WeakRef<object>>();
 const ownerChannelsByRefId = new Map<string, Set<Channel>>();
+// Strong hold while at least one holder channel is open: the referenced object
+// stays alive during holder use and becomes collectable once ALL channels
+// close (holders released). Without this, an object only referenced through
+// refs (WeakMap + WeakRef) could be collected while holders still call it.
+const ownerStrongRefs = new Map<string, object>();
 const refIdFinalizer = new FinalizationRegistry<string>((id) => {
-  // The real object is gone: its reference identity dies with it.
   objByRefId.delete(id);
   ownerChannelsByRefId.delete(id);
 });
@@ -140,15 +144,40 @@ type RefFrame =
   }
   | { type: "dispose" };
 
-/** Owner side: run the real object's methods for calls arriving on the channel. */
+/**
+ * Owner side: run the real object's methods for calls arriving on the channel.
+ * The closure captures only the refId (not the object), so the owner does NOT
+ * pin the object while holders are alive: the object is deref'd on each call
+ * and, once it is garbage-collected (all holders released), calls fail with a
+ * clear "released" error and the channel closes — the reference's address has
+ * died, the worker itself is unaffected.
+ */
 function startRefOwner(
   channel: Channel,
-  obj: unknown,
+  refId: string,
   registry: EncodeContext["registry"],
 ): void {
   channel.onMessage(async (message) => {
     const frame = message as RefFrame;
     if (frame.type === "call") {
+      const obj = objByRefId.get(refId)?.deref();
+      if (obj === undefined) {
+        // The referenced object was released: the address is dead.
+        channel.send(
+          {
+            type: "result",
+            id: frame.id,
+            ok: false,
+            error: serializeError(
+              new Error(
+                `Referenced object has been released (refId ${refId})`,
+              ),
+            ),
+          } satisfies RefFrame,
+        );
+        channel.close();
+        return;
+      }
       const fn = (obj as Record<string, unknown>)[frame.method];
       if (typeof fn !== "function") {
         channel.send(
@@ -191,8 +220,12 @@ function startRefOwner(
         );
       }
     } else if (frame.type === "dispose") {
-      // Optional cleanup hook on the real object (mirrors generator finally)
-      (obj as { [Symbol.dispose]?: () => void })[Symbol.dispose]?.();
+      // Optional cleanup hook on the real object (mirrors generator finally);
+      // skipped if the object was already released.
+      const obj = objByRefId.get(refId)?.deref();
+      if (obj !== undefined) {
+        (obj as { [Symbol.dispose]?: () => void })[Symbol.dispose]?.();
+      }
       channel.close();
     }
   });
@@ -443,16 +476,15 @@ function onServeRef(
     frame.port.close(); // owner no longer holds the object: nothing to serve
     return;
   }
-  const channel = connectChannel(frame.port);
+  const channel = connectChannel(frame.port, {
+    onClosed: () => {
+      untrackOwnerChannel(frame.refId, channel);
+      registry.unregisterChannel(channel);
+    },
+  });
   registry.registerChannel(channel);
-  startRefOwner(channel, obj, registry);
-  // Track as an owner-side channel so a round-trip home can close it.
-  let set = ownerChannelsByRefId.get(frame.refId);
-  if (!set) {
-    set = new Set();
-    ownerChannelsByRefId.set(frame.refId, set);
-  }
-  set.add(channel);
+  startRefOwner(channel, frame.refId, registry); // closure captures only the refId
+  trackOwnerChannel(frame.refId, channel);
 }
 
 // Control handlers are module-global (worker/main single-threaded).
@@ -477,6 +509,43 @@ interface RefCodecState {
   proxyByRefId: Map<string, WeakRef<RemoteRef<unknown>>>;
 }
 
+/**
+ * Register an owner-side channel for a refId. Cleanup on close is wired via
+ * the channel's onClosed option at creation (openChannel/connectChannel call
+ * sites); this helper only maintains the set membership.
+ */
+function trackOwnerChannel(
+  refId: string,
+  channel: Channel,
+): void {
+  let set = ownerChannelsByRefId.get(refId);
+  if (!set) {
+    set = new Set();
+    ownerChannelsByRefId.set(refId, set);
+  }
+  set.add(channel);
+  // First open channel: hold the object strongly (alive during holder use).
+  const obj = objByRefId.get(refId)?.deref();
+  if (obj !== undefined && !ownerStrongRefs.has(refId)) {
+    ownerStrongRefs.set(refId, obj);
+  }
+}
+
+/**
+ * Remove an owner-side channel from the refId's set (called on close).
+ */
+function untrackOwnerChannel(refId: string, channel: Channel): void {
+  const set = ownerChannelsByRefId.get(refId);
+  if (set) {
+    set.delete(channel);
+    if (set.size === 0) {
+      ownerChannelsByRefId.delete(refId);
+      // Last channel closed: the object is now collectable (mode-2 release).
+      ownerStrongRefs.delete(refId);
+    }
+  }
+}
+
 export const remoteRefCodec: Codec<RemoteRef<unknown>> = {
   tag: "remote-ref",
   matches(v: unknown): v is RemoteRef<unknown> {
@@ -487,20 +556,19 @@ export const remoteRefCodec: Codec<RemoteRef<unknown>> = {
   encode(v: RemoteRef<unknown>, ctx: EncodeContext): unknown {
     const ref = v as unknown as Record<PropertyKey, unknown>;
     if (ref[REF_BRAND] === true) {
-      // Fresh token: the owner produces a reference with a new channel.
+      // Fresh token: the owner produces a reference with a new channel. The
+      // closure captures only the refId, not the object.
       const obj = (ref as unknown as RefToken).obj as object;
       const refId = refIdFor(obj);
-      const { channel, peerPort } = openChannel(ctx);
+      const { channel, peerPort } = openChannel(ctx, {
+        onClosed: () => {
+          untrackOwnerChannel(refId, channel);
+          ctx.registry.unregisterChannel(channel);
+        },
+      });
       ctx.registry.registerChannel(channel);
-      startRefOwner(channel, obj, ctx.registry);
-      // Track the owner-side channel so a round-trip back to the owner can
-      // close it (the channel has completed its journey).
-      let set = ownerChannelsByRefId.get(refId);
-      if (!set) {
-        set = new Set();
-        ownerChannelsByRefId.set(refId, set);
-      }
-      set.add(channel);
+      startRefOwner(channel, refId, ctx.registry);
+      trackOwnerChannel(refId, channel);
       return {
         [CODEC_PLACEHOLDER_KEY]: "remote-ref",
         refId,

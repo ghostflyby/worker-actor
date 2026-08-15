@@ -42,13 +42,16 @@ export interface Channel {
 }
 
 /** The peer port is transferred with the placeholder; the local end is wrapped as a Channel. */
-export function openChannel(ctx: EncodeContext): {
+export function openChannel(
+  ctx: EncodeContext,
+  options?: ChannelOptions,
+): {
   channel: Channel;
   peerPort: MessagePort;
 } {
   const { port1, port2 } = new MessageChannel();
   ctx.transfer.push(port2);
-  return { channel: wrapPort(port1), peerPort: port2 };
+  return { channel: wrapPort(port1, options), peerPort: port2 };
 }
 
 /** Wrap a transferred peer port as a Channel on the receiving side. */

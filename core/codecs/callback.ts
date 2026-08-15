@@ -34,7 +34,13 @@ import {
   EncodeContext,
   getCodecState,
 } from "../codec.ts";
-import { connectChannel, openChannel, registerRelease } from "../channel.ts";
+import {
+  type Channel,
+  connectChannel,
+  openChannel,
+  registerRelease,
+} from "../channel.ts";
+import { serializeError } from "../protocol.ts";
 import { createRpcProxy, makeRpcHandler } from "../rpc.ts";
 
 /** The single method name on the owner-side API surface. */
@@ -71,8 +77,12 @@ type CallbackFrame =
   | { type: "dispose" };
 
 interface CallbackCodecState {
-  /** Live callback proxies; disposed on failAll (channels close via registerChannel). */
-  proxies: Set<RemoteCallback>;
+  /**
+   * Live callback proxies, disposed on failAll (channels close via
+   * registerChannel). WeakRef values so a dropped proxy is still collectable
+   * (the dedupe must not pin the GC-release path).
+   */
+  proxies: Set<WeakRef<RemoteCallback>>;
 }
 
 function matches(v: unknown): v is AnyFunction {
@@ -87,6 +97,15 @@ function getState(
   }));
 }
 
+function dropProxy(state: CallbackCodecState, cb: RemoteCallback): void {
+  for (const ref of state.proxies) {
+    if (ref.deref() === cb) {
+      state.proxies.delete(ref);
+      return;
+    }
+  }
+}
+
 function encode(fn: AnyFunction, ctx: EncodeContext): unknown {
   if (
     (fn as unknown as { [CALLBACK_BRAND]?: unknown })[CALLBACK_BRAND] === true
@@ -98,11 +117,22 @@ function encode(fn: AnyFunction, ctx: EncodeContext): unknown {
         "transmittable (functions travel by reference)",
     );
   }
-  const { channel, peerPort } = openChannel(ctx);
+  const { channel, peerPort } = openChannel(ctx, {
+    onClosed: () => {
+      // The channel is done: drop the fn weak-ref mapping and the registry
+      // pin, so a released callback (and its closure) is collectable.
+      fnByChannel.delete(channel);
+      ctx.registry.unregisterChannel(channel);
+    },
+  });
   ctx.registry.registerChannel(channel);
   // The owner side is exactly a single-function Actor: one method, the same
-  // makeRpcHandler machinery the main channel and links use. The function runs
-  // in this context (its closure), results/errors round-trip via the registry.
+  // makeRpcHandler machinery the main channel and links use. The function is
+  // held via a WeakRef so the owner does NOT pin it while the callback is
+  // alive elsewhere: once the caller releases the reference, the function and
+  // its closure become collectable.
+  const fnRef = new WeakRef<AnyFunction>(fn);
+  fnByChannel.set(channel, fnRef);
   const handler = makeRpcHandler(
     { [CALL]: fn as (...args: never[]) => unknown },
     ctx.registry,
@@ -110,6 +140,19 @@ function encode(fn: AnyFunction, ctx: EncodeContext): unknown {
   channel.onMessage((message) => {
     const frame = message as CallbackFrame;
     if (frame.type === "call") {
+      if (fnRef.deref() === undefined) {
+        // The callback function was released: the reference's address died.
+        channel.send(
+          {
+            type: "result",
+            id: frame.id,
+            ok: false,
+            error: serializeError(new Error("Callback has been released")),
+          } satisfies CallbackFrame,
+        );
+        channel.close();
+        return;
+      }
       void handler(frame).then((res) => {
         if (res.ok) {
           channel.send(
@@ -143,11 +186,16 @@ function encode(fn: AnyFunction, ctx: EncodeContext): unknown {
   } satisfies CallbackHandle;
 }
 
+/** Owner-side fn weak-ref map: channel → WeakRef(fn), for release semantics. */
+const fnByChannel = new WeakMap<Channel, WeakRef<AnyFunction>>();
+
 function decode(
   placeholder: CallbackHandle,
   ctx: DecodeContext,
 ): RemoteCallback {
-  const channel = connectChannel(placeholder.port);
+  const channel = connectChannel(placeholder.port, {
+    onClosed: () => ctx.registry.unregisterChannel(channel),
+  });
   ctx.registry.registerChannel(channel);
   const state = getState(ctx);
   const proxy = createRpcProxy(ctx.registry, {
@@ -176,7 +224,7 @@ function decode(
     channel.send({ type: "dispose" } satisfies CallbackFrame);
     proxy.rejectAll(new Error("Callback disposed"));
     channel.close();
-    state.proxies.delete(cb);
+    dropProxy(state, cb);
     unregisterRelease();
   };
 
@@ -202,16 +250,16 @@ function decode(
     channel.send({ type: "dispose" } satisfies CallbackFrame);
     proxy.rejectAll(new Error("Callback garbage-collected"));
     channel.close();
-    state.proxies.delete(cb);
+    dropProxy(state, cb);
   });
 
-  state.proxies.add(cb);
+  state.proxies.add(new WeakRef(cb));
   return cb;
 }
 
 function onRegistryFail(state: CallbackCodecState | undefined): void {
   if (!state) return;
-  for (const cb of state.proxies) cb.dispose();
+  for (const ref of state.proxies) ref.deref()?.dispose();
   state.proxies.clear();
   // open channels are closed by the registry's failAll() via registerChannel.
 }

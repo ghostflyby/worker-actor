@@ -29,7 +29,9 @@ export const rpc = {
   /** Create a Counter and hand its reference directly to worker C over the link. */
   createCounterAndSendToC(): string {
     if (!linkHandle) throw new Error("link not established");
-    linkHandle.send(remoteRef(new Counter()));
+    const c = new Counter();
+    heldObjects.push(c); // mode 1: the worker holds the object
+    linkHandle.send(remoteRef(c));
     return "sent";
   },
   getDisposedCount(): number {
@@ -76,8 +78,14 @@ export const peerApi = {
   },
 };
 
-/** A Counter shared across refs so the test can observe identity/restore. */
+/** A Counter shared across refs so the test can observe identity/restore.
+ *  Held explicitly (mode 1): worker-module top-level consts do not reliably
+ *  keep objects alive against GC in Deno workers, so the reference must not
+ *  be the only thing holding the object. */
 const sharedCounter = new Counter();
+// Array-rooted (module-level): keeps the shared object alive against GC in
+// this worker (verified: globalThis property anchoring is not a reliable root).
+const heldObjects: object[] = [sharedCounter];
 
 /** Contract type for B's served surface, exported for C's calls. */
 export type BPeerApi = PeerRpc<typeof peerApi>;

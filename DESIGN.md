@@ -481,6 +481,32 @@ to a member — picking a member, calling its spawn proxy (the same
 | handshake timeout      | dead state, rejects with "did it call serveWorker()?"                                                       |
 | `Symbol.dispose`       | supports `using actor = ...` (TS 5.2+)                                                                      |
 
+## Reference strength and release
+
+By-ref objects (remote-ref) and functions (callbacks) have no shared memory
+across workers — "cross-worker reference strength" is entirely a local closure
+graph in the owning process. The library's release semantics:
+
+- **Holder side**: a reference/callback proxy is held **weakly** (WeakRef
+  dedupe + FinalizationRegistry); once the holder drops it, GC notifies the
+  owner (a `dispose` frame) and the per-holder channel closes.
+- **Owner side (ref)**: the owner channel closure captures only the refId, not
+  the object; the object is deref'd on each call. While at least one holder
+  channel is open, the owner holds the object **strongly** (a per-refId strong
+  map); when the LAST channel closes, the strong ref is dropped and the object
+  becomes collectable.
+- **Owner side (callback)**: the function is held via WeakRef per channel; the
+  channel closure derefs it per call. Releasing the callback makes the function
+  (and its closure) collectable.
+- **Released object / function**: calls on a reference whose object was
+  collected fail with `RemoteError("… has been released")` and the channel
+  closes — the reference's address died, the worker is unaffected.
+- **Lifecycle contract**: an object held by the owner's own code (mode 1) stays
+  alive regardless of references; an object only reachable through references
+  (mode 2) dies once all holders release it. Closed channels self-remove from
+  the registry and owner tables, so finished closure chains (and transitively
+  released objects) are collectable immediately, not at actor death.
+
 ## Known limitations
 
 - The worker handshake is **not buffered**: call `spawn()` right after

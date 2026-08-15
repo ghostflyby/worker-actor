@@ -135,6 +135,15 @@ export class PayloadCodecRegistry {
     this.#channels.add(channel);
   }
 
+  /**
+   * Remove a channel from failAll tracking. A codec calls this when its
+   * channel closes (via onClosed), so the registry no longer pins the
+   * channel's closure chain once it is done.
+   */
+  unregisterChannel(channel: Channel): void {
+    this.#channels.delete(channel);
+  }
+
   /** Whether the tag is registered (a user codec registered first can override a built-in of the same tag). */
   has(tag: string): boolean {
     return this.#codecs.has(tag);

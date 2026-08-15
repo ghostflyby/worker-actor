@@ -242,3 +242,29 @@ Deno.test("acquire: multi-hop sharing A→main→B→C all reach the same owner 
   await b.dispose();
   await c.dispose();
 });
+
+Deno.test("release: mode-2 object is collectable once the holder drops the reference", async () => {
+  const actor = await spawnRefActor();
+  // Acquire an ephemeral object (only reachable through its reference), then
+  // drop the reference on this side. With the owner channel de-captured, the
+  // worker-side object has no strong reference left and must be collected.
+  await (async () => {
+    const ref = await actor.createEphemeral();
+    await (ref as RemoteRef<CounterRef>).increment(); // keep it briefly alive
+    // abandon: the async IIFE frame releases the reference
+  })();
+  if (forceGc) {
+    await yieldToEventLoop(4);
+    forceGc();
+    const deadline = Date.now() + 5_000;
+    let finalized = 0;
+    while (Date.now() < deadline) {
+      finalized = await actor.ephemeralFinalized();
+      if (finalized > 0) break;
+      forceGc();
+      await yieldToEventLoop(4);
+    }
+    assertEquals(finalized, 1);
+  }
+  await actor.dispose();
+});
