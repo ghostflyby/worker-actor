@@ -253,9 +253,22 @@ Constraints: both link endpoints must register a compatible codec set for the
 values they exchange (a mismatch fails loudly on decode, like the RPC
 handshake); only fresh tokens can be transmitted — a received reference proxy is
 not re-encodable (references are owned by their creator, mirroring the ActorRef
-semantics of "references cannot be serialized"). Direct RPC between linked
-workers (reusing request/response frames on the link) is a planned next step,
-not implemented yet.
+semantics of "references cannot be serialized").
+
+**Direct peer RPC over links** is implemented and reuses the same machinery as
+the main channel: `core/rpc.ts` provides channel-agnostic factories —
+`makeRpcHandler(api, registry)` (lookup → decode args → await → encode result,
+shared by `serveWorker` and every link) and `createRpcProxy(registry, send)`
+(pending-map + id correlation + codec encoding, shared by `spawn` and every
+link). A channel is just an adapter. The link frame set adds `call`/`result`,
+and each endpoint is simultaneously a serving side and a calling side
+(bidirectional). The peer-callable surface is **independent of the main-thread
+rpc**: `link.serve(peerApi)` declares what the peer may call (defaults to the
+main api, so management methods stay hidden unless re-exposed), and `link.rpc`
+proxies calls to the peer. Contract types cannot be derived across modules
+(workers have no import relationship), so the defining side exports
+`type XPeerApi = PeerRpc<typeof peerApi>` and the caller imports it type-only —
+worker-to-worker typing is an explicit contract, not inference.
 
 **Functions/closures are not codec-ified**: that would violate structured-clone
 semantics; `Remote<T>` already treats functions as RPC methods, not data.

@@ -1,6 +1,7 @@
-import { assert, assertEquals } from "@std/assert";
+import { assert, assertEquals, assertInstanceOf } from "@std/assert";
 import { link, spawn } from "./spawn.ts";
 import { remoteRefCodec } from "./examples/remote_ref/ref_codec.ts";
+import { RemoteError } from "./core/protocol.ts";
 import type * as LinkBModule from "./test_fixtures/link_b.ts";
 import type * as LinkCModule from "./test_fixtures/link_c.ts";
 
@@ -27,7 +28,7 @@ async function spawnLinked(label = "b-c") {
     codecs: [remoteRefCodec],
   });
   const unlink = link(workerB, workerC, label);
-  return { actorB, actorC, unlink };
+  return { workerB, workerC, actorB, actorC, unlink };
 }
 
 async function waitFor(
@@ -93,6 +94,50 @@ Deno.test("link: unlink closes the channel; further sends are inert", async () =
   // the closed link delivered nothing new: C still sees the first value
   assertEquals(await actorC.callLastIncrement(), 1);
 
+  await actorB.dispose();
+  await actorC.dispose();
+});
+
+// —— Direct peer RPC over the link ——
+// Contract types are exported by the fixture defining the surface; the caller
+// imports them type-only (no runtime import cycle between workers).
+
+Deno.test("link rpc: C calls B's served surface directly", async () => {
+  const { actorB, actorC } = await spawnLinked();
+  await actorC.callBEcho("hi");
+  assertEquals(await actorC.callBEcho("hi"), "echo:hi");
+  await actorB.dispose();
+  await actorC.dispose();
+});
+
+Deno.test("link rpc: peer error propagates as RemoteError", async () => {
+  const { actorB, actorC } = await spawnLinked();
+  const outcome = await actorC.callBBoom().then(
+    () => "unexpectedly resolved" as const,
+    (e: unknown) => e,
+  );
+  assertInstanceOf(outcome, RemoteError);
+  assertEquals(outcome.name, "RangeError");
+  assert(outcome.message.includes("peer boom"));
+  await actorB.dispose();
+  await actorC.dispose();
+});
+
+Deno.test("link rpc: served surface hides management methods", async () => {
+  const { actorB, actorC } = await spawnLinked();
+  const outcome = await actorC.callBMissing().then(
+    () => "unexpectedly resolved" as const,
+    (e: unknown) => e,
+  );
+  assertInstanceOf(outcome, RemoteError);
+  assert(outcome.message.includes("getDisposedCount"));
+  await actorB.dispose();
+  await actorC.dispose();
+});
+
+Deno.test("link rpc: bidirectional — B calls C's served surface", async () => {
+  const { actorB, actorC } = await spawnLinked();
+  assertEquals(await actorB.callCPing(), "pong");
   await actorB.dispose();
   await actorC.dispose();
 });

@@ -11,13 +11,15 @@ export { ActorDiedError, RemoteError } from "./core/protocol.ts";
 export type { Frame, SerializedError } from "./core/protocol.ts";
 export { createRemoteIterable, startStreamProducer } from "./core/stream.ts";
 
-// —— 通用 Codec 机制 ——
+// —— Generic Codec mechanism ——
 export {
   CODEC_PLACEHOLDER_KEY,
   getCodecState,
   PayloadCodecRegistry,
 } from "./core/codec.ts";
 export type { Codec, DecodeContext, EncodeContext } from "./core/codec.ts";
+export { createRpcProxy, makeRpcHandler } from "./core/rpc.ts";
+export type { PeerRpc, RpcApi } from "./core/rpc.ts";
 export { iterableCodec } from "./core/codecs/iterable.ts";
 export { createErrorCodec, errorCodec } from "./core/codecs/error.ts";
 export type { ErrorCodecOptions } from "./core/codecs/error.ts";

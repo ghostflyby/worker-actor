@@ -1,6 +1,8 @@
 /** Test fixture: worker B — holds a real Counter object and hands its reference to C over the link. */
 import { serveWorker } from "../mod.ts";
 import type { LinkHandle } from "../worker_runtime.ts";
+import type { PeerRpc } from "../core/rpc.ts";
+import type { CPeerApi } from "./link_c.ts"; // type-only: no runtime import cycle
 import {
   type RemoteRef,
   remoteRef,
@@ -40,12 +42,37 @@ export const rpc = {
     return (lastFromC as RemoteRef<{ hello(n: string): Promise<string> }>)
       .hello(name);
   },
+  /** Direct peer RPC: B calls C's served surface (executes in C). */
+  callCPing(): Promise<string> {
+    return (linkHandle!.rpc as unknown as CPeerApi).ping();
+  },
 };
+
+/**
+ * Peer-facing surface: what worker C may call on B over the link. Deliberately
+ * narrower than the main-thread rpc — management methods (getDisposedCount)
+ * stay hidden from the peer. The contract type lives in the test.
+ */
+export const peerApi = {
+  echo(s: string): string {
+    return `echo:${s}`;
+  },
+  boom(): never {
+    throw new RangeError("peer boom");
+  },
+  describe(): string {
+    return "b";
+  },
+};
+
+/** Contract type for B's served surface, exported for C's calls. */
+export type BPeerApi = PeerRpc<typeof peerApi>;
 
 serveWorker(rpc, {
   codecs: [remoteRefCodec],
   onLink(link) {
     linkHandle = link;
+    link.serve(peerApi);
     link.onValue((v) => {
       lastFromC = v;
     });

@@ -11,13 +11,9 @@
  *   const sum = await actor.add(1, 2); // sum: number, type-safe
  */
 
-import {
-  ActorDiedError,
-  Frame,
-  PROTOCOL_VERSION,
-  RemoteError,
-} from "./core/protocol.ts";
+import { ActorDiedError, Frame, PROTOCOL_VERSION } from "./core/protocol.ts";
 import { type Codec, PayloadCodecRegistry } from "./core/codec.ts";
+import { createRpcProxy } from "./core/rpc.ts";
 import { iterableCodec } from "./core/codecs/iterable.ts";
 import { errorCodec } from "./core/codecs/error.ts";
 import { abortSignalCodec } from "./core/codecs/abort_signal.ts";
@@ -64,11 +60,6 @@ export interface SpawnOptions {
   codecs?: Codec<unknown>[];
 }
 
-interface PendingCall {
-  resolve: (value: unknown) => void;
-  reject: (reason: unknown) => void;
-}
-
 const HANDSHAKE_TIMEOUT = 10_000;
 
 /** Lifecycle methods attached to the proxy (not part of Remote<T> itself). */
@@ -108,14 +99,27 @@ export async function spawn<T>(
   // `new Worker(...)`. If messages arrive before the onmessage handler below is
   // set (e.g. another await in between), the handshake is lost and spawn()
   // waits until the handshake timeout.
-  const pending = new Map<number, PendingCall>();
   const registry = new PayloadCodecRegistry();
   // User codecs register first (can override a built-in of the same tag); built-ins fill in after.
   for (const codec of options.codecs ?? []) registry.register(codec);
   for (const codec of [iterableCodec, errorCodec, abortSignalCodec]) {
     if (!registry.has(codec.tag)) registry.register(codec);
   }
-  let nextId = 1;
+  // The RPC machinery is channel-agnostic (core/rpc.ts): the main channel is
+  // just another adapter, identical to a worker-to-worker link.
+  const rpcProxy = createRpcProxy(registry, {
+    send: (request, transfer) =>
+      worker.postMessage(
+        {
+          type: "request",
+          id: request.id,
+          method: request.method,
+          args: request.args,
+        } satisfies Frame,
+        { transfer },
+      ),
+    isDead: () => dead,
+  });
   let dead = false;
   let resolveHandshake: (() => void) | undefined;
   let rejectHandshake: ((reason: unknown) => void) | undefined;
@@ -157,11 +161,7 @@ export async function spawn<T>(
       return;
     }
     if (frame.type === "response") {
-      const call = pending.get(frame.id);
-      if (!call) return; // unknown id: possibly a late response after dispose
-      pending.delete(frame.id);
-      if (frame.ok) call.resolve(registry.decode(frame.value));
-      else call.reject(new RemoteError(frame.error));
+      rpcProxy.deliver(frame);
     }
   };
 
@@ -178,31 +178,17 @@ export async function spawn<T>(
     if (dead) return;
     dead = true;
     registry.failAll();
-    for (const call of pending.values()) call.reject(reason);
-    pending.clear();
+    rpcProxy.rejectAll(reason);
     // If the handshake hasn't finished yet (version/codec mismatch, worker crash),
     // reject it so spawn() fails instead of hanging.
     rejectHandshake?.(reason);
     worker.terminate();
   }
 
-  function invoke(method: string, args: unknown[]): Promise<unknown> {
-    // Always return a rejected promise, never throw synchronously:
-    // await and .catch behave identically for callers.
-    if (dead) return Promise.reject(new ActorDiedError());
-    return new Promise((resolve, reject) => {
-      const id = nextId++;
-      pending.set(id, { resolve, reject });
-      const transfer: Transferable[] = [];
-      const payload: Frame = {
-        type: "request",
-        id,
-        method,
-        args: registry.encode(args, transfer) as unknown[],
-      };
-      worker.postMessage(payload, { transfer });
-    });
-  }
+  // Always return a rejected promise, never throw synchronously:
+  // await and .catch behave identically for callers.
+  const invoke = (method: string, args: unknown[]): Promise<unknown> =>
+    rpcProxy.call(method, args);
 
   const dispose = (): Promise<void> => {
     if (dead) return Promise.resolve();
@@ -213,8 +199,7 @@ export async function spawn<T>(
     } finally {
       worker.terminate();
     }
-    for (const call of pending.values()) call.reject(new ActorDiedError());
-    pending.clear();
+    rpcProxy.rejectAll(new ActorDiedError());
     return Promise.resolve();
   };
 
