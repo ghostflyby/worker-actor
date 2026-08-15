@@ -18,3 +18,11 @@ export { iterableCodec } from "./core/codecs/iterable.ts";
 export { createErrorCodec, errorCodec } from "./core/codecs/error.ts";
 export type { ErrorCodecOptions } from "./core/codecs/error.ts";
 export { abortSignalCodec } from "./core/codecs/abort_signal.ts";
+
+// —— High-level channel abstraction for codec authors ——
+export {
+  connectChannel,
+  openChannel,
+  registerRelease,
+} from "./core/channel.ts";
+export type { Channel, ChannelOptions } from "./core/channel.ts";

@@ -28,13 +28,15 @@ protocol), a **proxy** (Proxy + incrementing ids correlating request/response),
 mod.ts                    # public exports
 core/protocol.ts          # frame types, error serialization, handshake version
 core/codec.ts             # generic Codec interface + PayloadCodecRegistry (deep walk/placeholder/lifecycle)
+core/channel.ts           # high-level Channel abstraction for codec authors (open/connect/release)
 core/codecs/              # built-in codecs: iterable / error / abort-signal
-core/stream.ts            # stream channel primitives (MessageChannel pump/rebuild/backpressure/release)
+core/stream.ts            # stream protocol on top of Channel (pump/rebuild/backpressure/release)
 spawn.ts                  # main-thread: spawn() → type-safe Proxy + lifecycle + codec validation
 worker_runtime.ts         # worker-side: serveWorker(api) registers RPC, handshake, dispatch
 examples/calculator/      # end-to-end example (worker.ts + main.ts)
+examples/remote_ref/      # custom marshal-by-ref codec (the .NET MarshalByRef pattern)
 test_fixtures/            # test-only worker for the codec mechanism
-main_test.ts / codec_test.ts  # integration tests over real Workers
+main_test.ts / codec_test.ts / ref_test.ts  # integration tests over real Workers
 ```
 
 ## Usage
@@ -191,6 +193,37 @@ quasi-transfer" semantics — it can be cloned only once, before reading or
 locking, and the original is disturbed afterwards. Use native cloning when the
 stream is handed over once for consumption; to keep the original usable or hook
 lifecycle, go through the iterable channel via `rs[Symbol.asyncIterator]()`.
+
+### Channel abstraction for custom protocols
+
+The stream primitives are a special case of a more general need: a codec often
+wants a dedicated cross-thread channel with its own wire protocol — streaming
+elements, abort propagation, or a custom **marshal-by-ref** protocol (the .NET
+MarshalByRef pattern). `core/channel.ts` is the high-level counterpart to raw
+MessageChannel handling, owned by the codec author:
+
+- `openChannel(ctx)` — create a MessageChannel and automatically add the peer
+  port to `ctx.transfer` (transferred with the placeholder); returns a `Channel`
+  wrapping the local port.
+- `connectChannel(port)` — wrap a transferred port as a `Channel`.
+- `registerChannel(channel)` (on the registry) — failAll() closes every open
+  channel when the actor dies.
+- `registerRelease(target, onReleased)` — FinalizationRegistry wrapper for
+  GC-based release; returns an unregister function so explicit close keeps
+  release single.
+
+The library deliberately provides **no automatic protocol on a channel**: a
+codec gets the channel and defines its own frames. What the library guarantees
+is channel creation, port transfer, closure and GC-based release.
+`EncodeContext` and `DecodeContext` now expose the `registry`, so a codec can
+recurse into nested payloads — frames on its own channel whose args/results may
+contain streams or other codec values.
+
+`examples/remote_ref/` demonstrates the pattern: a custom `remote-ref` codec
+turns any object into a cross-thread reference (method calls marshaled over a
+dedicated channel, errors serialized back, dispose/GC release, nested streams
+flowing through reference results). It is an example, not a built-in — the
+library stays protocol-agnostic.
 
 **Functions/closures are not codec-ified**: that would violate structured-clone
 semantics; `Remote<T>` already treats functions as RPC methods, not data.

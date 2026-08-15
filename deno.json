@@ -1,6 +1,7 @@
 {
   "tasks": {
     "demo": "deno run --allow-read examples/calculator/main.ts",
+    "demo:ref": "deno run --allow-read examples/remote_ref/main.ts",
     "test": "deno test --allow-read"
   },
   "imports": {

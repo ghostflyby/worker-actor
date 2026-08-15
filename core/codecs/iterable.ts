@@ -1,5 +1,5 @@
 /**
- * iterable codec: transports AsyncIterable/Iterable over a dedicated MessageChannel.
+ * iterable codec: transports AsyncIterable/Iterable over a dedicated Channel.
  *
  * Matching and handling (in codec registration order):
  *   - AsyncIterable (incl. async generator results): goes straight onto a channel.
@@ -10,13 +10,14 @@
  *   - Natively cloneable containers (arrays/Map/Set/TypedArray/ArrayBuffer) don't
  *     match this codec and travel via structured clone as-is.
  *
- * Channel protocol and semantics (lazy/backpressure/release/error/death) are
- * implemented by core/stream.ts primitives; this codec only does matching and
- * placeholder translation.
+ * Stream protocol and semantics (lazy/backpressure/release/error/death) are
+ * implemented by core/stream.ts on top of the generic Channel abstraction;
+ * this codec only does matching and placeholder translation.
  *
- * State (channel sets) is isolated per registry instance through the registry's
- * state slot — each actor has its own registry, so one actor's death never
- * closes another's streams.
+ * State is isolated per registry instance through the registry's state slot —
+ * each actor has its own registry, so one actor's death never closes another's
+ * streams. Channels are additionally tracked via ctx.registry.registerChannel
+ * so failAll() closes every open stream channel.
  */
 
 import {
@@ -26,6 +27,7 @@ import {
   EncodeContext,
   getCodecState,
 } from "../codec.ts";
+import { connectChannel, openChannel, registerRelease } from "../channel.ts";
 import { createRemoteIterable, startStreamProducer } from "../stream.ts";
 
 interface StreamHandle {
@@ -34,19 +36,11 @@ interface StreamHandle {
 }
 
 interface IterableCodecState {
-  activePorts: Set<MessagePort>;
+  /** Producer-side stops (release the generator) for failAll. */
   producerStops: Set<() => void>;
+  /** Consumer-side fails (reject pending next()) for failAll. */
   consumerFails: Set<() => void>;
 }
-
-/**
- * Finalizer for rebuilt iterables: when one is garbage-collected on this side,
- * tell the producer side (via the stream's own channel) to release the original
- * object graph. Best-effort only — explicit return()/done/error/fail are the
- * deterministic release paths; the finalizer never holds a strong ref to the
- * registered target.
- */
-const releaseRegistry = new FinalizationRegistry<() => void>((fn) => fn());
 
 function isAsyncIterable(v: unknown): v is AsyncIterable<unknown> {
   return (
@@ -91,7 +85,6 @@ function getState(
   ctx: { codecState: Map<Codec, unknown> },
 ): IterableCodecState {
   return getCodecState<IterableCodecState>(ctx, iterableCodec, () => ({
-    activePorts: new Set(),
     producerStops: new Set(),
     consumerFails: new Set(),
   }));
@@ -104,22 +97,20 @@ function encode(value: AsyncIterable<unknown>, ctx: EncodeContext): unknown {
   const iterable = isAsyncIterable(value)
     ? value
     : toAsyncIterable(value as Iterable<unknown>);
-  const { port1, port2 } = new MessageChannel();
+  const { channel, peerPort } = openChannel(ctx);
+  ctx.registry.registerChannel(channel);
   const state = getState(ctx);
   // stopFn self-removes from the registry once the stream ends (done/error/
   // release), so the original iterable's object graph becomes collectable even
   // while the actor stays alive.
   let stopFn: () => void = () => {};
-  stopFn = startStreamProducer(port1, iterable, () => {
+  stopFn = startStreamProducer(channel, iterable, () => {
     state.producerStops.delete(stopFn);
-    state.activePorts.delete(port2);
   });
-  state.activePorts.add(port2);
   state.producerStops.add(stopFn);
-  ctx.transfer.push(port2);
   return {
     [CODEC_PLACEHOLDER_KEY]: "iterable",
-    port: port2,
+    port: peerPort,
   } satisfies StreamHandle;
 }
 
@@ -127,25 +118,27 @@ function decode(
   placeholder: { port: MessagePort },
   ctx: DecodeContext,
 ): AsyncIterable<unknown> {
+  const channel = connectChannel(placeholder.port);
+  ctx.registry.registerChannel(channel);
   const state = getState(ctx);
   let failFn: () => void = () => {};
-  const token = {};
+  let unregister: () => void = () => {};
   const { iterable, fail, detach } = createRemoteIterable(
-    placeholder.port,
+    channel,
     () => {
       state.consumerFails.delete(failFn);
-      releaseRegistry.unregister(token);
+      unregister(); // explicit path: done/error/return/fail — no GC release later
     },
   );
   failFn = fail;
   state.consumerFails.add(failFn);
-  state.activePorts.delete(placeholder.port);
-  // Best-effort release on GC: the finalizer only captures the port and detach —
-  // never the iterable itself — so it cannot keep the target alive.
-  releaseRegistry.register(iterable as object, () => {
-    placeholder.port.postMessage({ type: "release" });
+  // Best-effort release on GC: the finalizer captures only the channel and
+  // detach — never the iterable itself — so it cannot keep the target alive.
+  unregister = registerRelease(iterable as object, () => {
+    channel.send({ type: "release" });
+    channel.close();
     detach();
-  }, token);
+  });
   return iterable;
 }
 
@@ -153,10 +146,9 @@ function onRegistryFail(state: IterableCodecState | undefined): void {
   if (!state) return;
   for (const fail of state.consumerFails) fail();
   for (const stop of state.producerStops) stop();
-  for (const port of state.activePorts) port.close();
   state.consumerFails.clear();
   state.producerStops.clear();
-  state.activePorts.clear();
+  // open channels are closed by the registry's failAll() via registerChannel.
 }
 
 export const iterableCodec: Codec<AsyncIterable<unknown>> = {

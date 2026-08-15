@@ -26,17 +26,26 @@
 /** Field name inside a placeholder that identifies the codec tag. */
 export const CODEC_PLACEHOLDER_KEY = "__wCodec";
 
+import type { Channel } from "./channel.ts";
+
 export interface EncodeContext {
   /** structured clone transfer list: ports etc. created by codecs are pushed here. */
   transfer: Transferable[];
   seen: WeakMap<object, unknown>;
   /** Per-codec state slot held by the registry; codecs read/write it themselves. */
   codecState: Map<Codec, unknown>;
+  /**
+   * The registry driving this encode. Codecs use it to recurse into nested
+   * payloads (e.g. frames on their own channel whose args/results may contain
+   * streams or other codec values) and to track channels for failAll cleanup.
+   */
+  registry: PayloadCodecRegistry;
 }
 
 export interface DecodeContext {
   seen: WeakMap<object, unknown>;
   codecState: Map<Codec, unknown>;
+  registry: PayloadCodecRegistry;
 }
 
 export interface Codec<T = unknown> {
@@ -99,6 +108,7 @@ export class PayloadCodecRegistry {
   #codecs = new Map<string, Codec>();
   #order: Codec[] = [];
   #codecState = new Map<Codec, unknown>();
+  #channels = new Set<Channel>();
 
   register(codec: Codec): this {
     if (this.#codecs.has(codec.tag)) {
@@ -115,6 +125,14 @@ export class PayloadCodecRegistry {
       this.#codecs.delete(tag);
       this.#order = this.#order.filter((c) => c !== codec);
     }
+  }
+
+  /**
+   * Track a channel opened by a codec so failAll() closes it when the actor
+   * dies. close() is idempotent, so a channel that already ended is a no-op.
+   */
+  registerChannel(channel: Channel): void {
+    this.#channels.add(channel);
   }
 
   /** Whether the tag is registered (a user codec registered first can override a built-in of the same tag). */
@@ -147,6 +165,7 @@ export class PayloadCodecRegistry {
           transfer,
           seen,
           codecState: this.#codecState,
+          registry: this,
         });
         seen.set(v, placeholder);
         return placeholder;
@@ -213,6 +232,7 @@ export class PayloadCodecRegistry {
       const decoded = codec.decode(v, {
         seen,
         codecState: this.#codecState,
+        registry: this,
       });
       seen.set(v, decoded);
       return decoded;
@@ -253,5 +273,7 @@ export class PayloadCodecRegistry {
     for (const codec of this.#order) {
       codec.onRegistryFail?.(this.#codecState.get(codec));
     }
+    for (const channel of this.#channels) channel.close();
+    this.#channels.clear();
   }
 }

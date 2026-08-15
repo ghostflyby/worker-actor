@@ -40,6 +40,7 @@ import {
   EncodeContext,
   getCodecState,
 } from "../codec.ts";
+import { connectChannel, openChannel } from "../channel.ts";
 
 interface AbortFrame {
   type: "status" | "abort" | "release";
@@ -53,12 +54,10 @@ interface AbortSignalHandle {
 }
 
 interface AbortCodecState {
-  /** Sender-side cleanup (stop forwarding, remove listener, close port1). */
+  /** Sender-side cleanup (stop forwarding, remove listener, close the channel). */
   senders: Set<() => void>;
   /** Receiver-side abort on failAll (cancels the rebuilt signal). */
   receivers: Set<() => void>;
-  /** port2 transferred to the peer; closed as a safety net on failAll. */
-  port2s: Set<MessagePort>;
 }
 
 function matches(v: unknown): v is AbortSignal {
@@ -69,17 +68,17 @@ function getState(ctx: { codecState: Map<Codec, unknown> }): AbortCodecState {
   return getCodecState<AbortCodecState>(ctx, abortSignalCodec, () => ({
     senders: new Set(),
     receivers: new Set(),
-    port2s: new Set(),
   }));
 }
 
 function encode(signal: AbortSignal, ctx: EncodeContext): unknown {
-  const { port1, port2 } = new MessageChannel();
+  const { channel, peerPort } = openChannel(ctx);
+  ctx.registry.registerChannel(channel);
   const state = getState(ctx);
   let stopped = false;
 
   const post = (frame: AbortFrame): void => {
-    if (!stopped) port1.postMessage(frame);
+    if (!stopped) channel.send(frame);
   };
 
   post({ type: "status", aborted: signal.aborted, reason: signal.reason });
@@ -96,20 +95,17 @@ function encode(signal: AbortSignal, ctx: EncodeContext): unknown {
     if (stopped) return;
     stopped = true;
     signal.removeEventListener("abort", onAbort);
-    port1.close();
+    channel.close();
     state.senders.delete(cleanup);
-    state.port2s.delete(port2);
   };
 
   if (!signal.aborted) {
     signal.addEventListener("abort", onAbort, { once: true });
   }
   state.senders.add(cleanup);
-  state.port2s.add(port2);
-  ctx.transfer.push(port2);
   return {
     [CODEC_PLACEHOLDER_KEY]: "abort-signal",
-    port: port2,
+    port: peerPort,
   } satisfies AbortSignalHandle;
 }
 
@@ -119,7 +115,10 @@ function decode(
 ): AbortSignal {
   const controller = new AbortController();
   const state = getState(ctx);
-  const port = placeholder.port;
+  const channel = connectChannel(placeholder.port, {
+    onMessageError: () => teardown(true),
+  });
+  ctx.registry.registerChannel(channel);
   let closed = false;
 
   // teardown is the single idempotent release path; abortLocal decides whether
@@ -129,13 +128,13 @@ function decode(
   function teardown(abortLocal: boolean): void {
     if (closed) return;
     closed = true;
-    port.close();
+    channel.close();
     state.receivers.delete(failAllCleanup);
     if (abortLocal && !controller.signal.aborted) controller.abort();
   }
 
-  port.onmessage = (ev: MessageEvent<AbortFrame>) => {
-    const frame = ev.data;
+  channel.onMessage((message) => {
+    const frame = message as AbortFrame;
     if (frame.type === "status") {
       if (frame.aborted && !controller.signal.aborted) {
         controller.abort(frame.reason);
@@ -146,8 +145,7 @@ function decode(
     } else if (frame.type === "release") {
       teardown(false);
     }
-  };
-  port.onmessageerror = () => teardown(true);
+  });
 
   state.receivers.add(failAllCleanup);
 
@@ -158,10 +156,9 @@ function onRegistryFail(state: AbortCodecState | undefined): void {
   if (!state) return;
   for (const cleanup of state.senders) cleanup();
   for (const abort of state.receivers) abort();
-  for (const port of state.port2s) port.close();
   state.senders.clear();
   state.receivers.clear();
-  state.port2s.clear();
+  // open channels are closed by the registry's failAll() via registerChannel.
 }
 
 export const abortSignalCodec: Codec<AbortSignal> = {
