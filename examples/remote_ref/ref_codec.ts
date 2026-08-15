@@ -105,9 +105,80 @@ const ownerChannelsByRefId = new Map<string, Set<Channel>>();
 // close (holders released). Without this, an object only referenced through
 // refs (WeakMap + WeakRef) could be collected while holders still call it.
 const ownerStrongRefs = new Map<string, object>();
+// Owner-side liveness: last keepalive seen per holder channel; a channel with
+// no heartbeat past the timeout is a zombie (its holder worker died) and is
+// released. Defaults suit production; tests shorten them via rpc.
+let keepaliveIntervalMs = 2_000;
+let keepaliveTimeoutMs = 6_000;
+const channelLastSeen = new Map<Channel, number>();
+const channelRefId = new Map<Channel, string>();
+let keepaliveScanner: ReturnType<typeof setInterval> | undefined;
+
+/** Configure keepalive (interval / timeout) — test hook; defaults are production-safe. */
+export function setKeepaliveParams(
+  intervalMs: number,
+  timeoutMs: number,
+): void {
+  keepaliveIntervalMs = intervalMs;
+  keepaliveTimeoutMs = timeoutMs;
+}
+
+function ensureKeepaliveScanner(): void {
+  if (keepaliveScanner) return;
+  keepaliveScanner = setInterval(() => {
+    const now = Date.now();
+    for (const [channel, last] of channelLastSeen) {
+      if (now - last > keepaliveTimeoutMs) {
+        // Zombie holder: release the object (broadcast + close + drop strong ref).
+        releaseRefId(channelRefId.get(channel) ?? "");
+      }
+    }
+  }, Math.max(1_000, Math.floor(keepaliveTimeoutMs / 3)));
+}
+
+/**
+ * Release a refId: broadcast `released` to every holder, close their channels,
+ * drop the strong hold. Peers die immediately; the object becomes collectable.
+ */
+function releaseRefId(refId: string): void {
+  const channels = ownerChannelsByRefId.get(refId);
+  if (channels) {
+    for (const c of channels) {
+      channelLastSeen.delete(c);
+      channelRefId.delete(c);
+      c.send({ type: "released" } satisfies RefFrame);
+      c.close();
+    }
+    ownerChannelsByRefId.delete(refId);
+  }
+  ownerStrongRefs.delete(refId);
+}
+
+/** Owner-side explicit release: the actor decides its byref object dies. */
+export function releaseRef(obj: object): void {
+  const refId = refIdByObj.get(obj);
+  if (refId !== undefined) releaseRefId(refId);
+}
+
+/** How many objects the owner is holding strongly (release probe). */
+export function ownerStrongRefCount(): number {
+  return ownerStrongRefs.size;
+}
+
+/** Tombstone finalizer: whatever caused the object's collection, sweep the
+ *  owner's bookkeeping and broadcast so no peer is left with a dead ref. */
 const refIdFinalizer = new FinalizationRegistry<string>((id) => {
+  const channels = ownerChannelsByRefId.get(id);
+  if (channels) {
+    for (const c of channels) {
+      channelLastSeen.delete(c);
+      c.send({ type: "released" } satisfies RefFrame);
+      c.close();
+    }
+    ownerChannelsByRefId.delete(id);
+  }
   objByRefId.delete(id);
-  ownerChannelsByRefId.delete(id);
+  ownerStrongRefs.delete(id);
 });
 
 function refIdFor(obj: object): string {
@@ -142,7 +213,11 @@ type RefFrame =
     ok: false;
     error: { name: string; message: string; stack?: string };
   }
-  | { type: "dispose" };
+  | { type: "dispose" }
+  /** Owner → all holders: the object was released; every proxy dies immediately. */
+  | { type: "released" }
+  /** Holder → owner: liveness heartbeat (owner releases zombies on timeout). */
+  | { type: "keepalive" };
 
 /**
  * Owner side: run the real object's methods for calls arriving on the channel.
@@ -219,6 +294,9 @@ function startRefOwner(
           } satisfies RefFrame,
         );
       }
+    } else if (frame.type === "keepalive") {
+      // Holder liveness: refresh the last-seen stamp for the timeout sweep.
+      channelLastSeen.set(channel, Date.now());
     } else if (frame.type === "dispose") {
       // Optional cleanup hook on the real object (mirrors generator finally);
       // skipped if the object was already released.
@@ -258,12 +336,23 @@ function createRefProxy(
       pending.delete(frame.id);
       if (frame.ok) call.resolve(registry.decode(frame.value));
       else call.reject(new RemoteError(frame.error));
+    } else if (frame.type === "released") {
+      fail(new Error("Reference released by its owner"));
     }
   });
+
+  // Holder liveness heartbeat: the owner releases zombie channels (a dead
+  // holder worker stops sending) after a timeout. Stops when the proxy dies.
+  const keepalive = setInterval(() => {
+    if (!closed) {
+      channel.send({ type: "keepalive" } satisfies RefFrame);
+    }
+  }, keepaliveIntervalMs);
 
   const fail = (reason: unknown): void => {
     if (closed) return;
     closed = true;
+    clearInterval(keepalive);
     for (const call of pending.values()) call.reject(reason);
     pending.clear();
     channel.close();
@@ -290,6 +379,7 @@ function createRefProxy(
   const dispose = (): void => {
     if (closed) return;
     closed = true;
+    clearInterval(keepalive);
     channel.send({ type: "dispose" } satisfies RefFrame);
     channel.close();
     for (const call of pending.values()) {
@@ -524,6 +614,9 @@ function trackOwnerChannel(
     ownerChannelsByRefId.set(refId, set);
   }
   set.add(channel);
+  channelRefId.set(channel, refId);
+  channelLastSeen.set(channel, Date.now());
+  ensureKeepaliveScanner();
   // First open channel: hold the object strongly (alive during holder use).
   const obj = objByRefId.get(refId)?.deref();
   if (obj !== undefined && !ownerStrongRefs.has(refId)) {
@@ -538,6 +631,8 @@ function untrackOwnerChannel(refId: string, channel: Channel): void {
   const set = ownerChannelsByRefId.get(refId);
   if (set) {
     set.delete(channel);
+    channelLastSeen.delete(channel);
+    channelRefId.delete(channel);
     if (set.size === 0) {
       ownerChannelsByRefId.delete(refId);
       // Last channel closed: the object is now collectable (mode-2 release).

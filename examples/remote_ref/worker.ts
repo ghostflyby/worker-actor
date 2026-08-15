@@ -3,9 +3,12 @@ import { serveWorker } from "../../mod.ts";
 import {
   isRemoteRef,
   ownerChannelCountFor,
+  releaseRef,
   type RemoteRef,
   remoteRef,
   remoteRefCodec,
+  ownerStrongRefCount,
+  setKeepaliveParams,
 } from "./ref_codec.ts";
 
 /** How many real objects were released via [Symbol.dispose] — observable probe. */
@@ -67,6 +70,26 @@ export const rpc = {
     heldObjects.length = 0;
     return "released";
   },
+  /** Release a held object explicitly (owner-side releaseRef). */
+  releaseRefByName(name: string): string {
+    releaseRef(namedObjects.get(name)!);
+    return "released";
+  },
+  /** Register a named object that can later be released. */
+  registerNamed(name: string): RemoteRef<Counter> {
+    const c = new Counter();
+    namedObjects.set(name, c);
+    return remoteRef(c);
+  },
+  /** How many objects this worker holds strongly (release probe). */
+  strongRefCount(): number {
+    return ownerStrongRefCount();
+  },
+  /** Configure keepalive params (test hook). */
+  setKeepalive(intervalMs: number, timeoutMs: number): string {
+    setKeepaliveParams(intervalMs, timeoutMs);
+    return "set";
+  },
   sharedCounter(): RemoteRef<Counter> {
     return remoteRef(shared);
   },
@@ -103,6 +126,7 @@ export const rpc = {
 
 let heldRef: RemoteRef<unknown> | undefined;
 const heldObjects: object[] = [];
+const namedObjects = new Map<string, object>();
 let ephemeralFinalizedCount = 0;
 const ephemeralFinalizer = new FinalizationRegistry<void>(() => {
   ephemeralFinalizedCount++;

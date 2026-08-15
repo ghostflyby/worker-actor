@@ -40,7 +40,6 @@ import {
   openChannel,
   registerRelease,
 } from "../channel.ts";
-import { serializeError } from "../protocol.ts";
 import { createRpcProxy, makeRpcHandler } from "../rpc.ts";
 
 /** The single method name on the owner-side API surface. */
@@ -74,7 +73,9 @@ type CallbackFrame =
     ok: false;
     error: { name: string; message: string; stack?: string };
   }
-  | { type: "dispose" };
+  | { type: "dispose" }
+  /** Owner → caller: the callback was released; the reference dies immediately. */
+  | { type: "released" };
 
 interface CallbackCodecState {
   /**
@@ -119,20 +120,20 @@ function encode(fn: AnyFunction, ctx: EncodeContext): unknown {
   }
   const { channel, peerPort } = openChannel(ctx, {
     onClosed: () => {
-      // The channel is done: drop the fn weak-ref mapping and the registry
-      // pin, so a released callback (and its closure) is collectable.
+      // The channel is done: drop the strong hold and the registry pin, so a
+      // released callback (and its closure) is collectable.
       fnByChannel.delete(channel);
+      fnChannel.delete(fn);
       ctx.registry.unregisterChannel(channel);
     },
   });
   ctx.registry.registerChannel(channel);
   // The owner side is exactly a single-function Actor: one method, the same
-  // makeRpcHandler machinery the main channel and links use. The function is
-  // held via a WeakRef so the owner does NOT pin it while the callback is
-  // alive elsewhere: once the caller releases the reference, the function and
-  // its closure become collectable.
-  const fnRef = new WeakRef<AnyFunction>(fn);
-  fnByChannel.set(channel, fnRef);
+  // makeRpcHandler machinery the main channel and links use. Strong hold while
+  // the channel is open (conditional-strong, aligned with refs): the function
+  // stays alive during caller use and becomes collectable once released.
+  fnByChannel.set(channel, fn);
+  fnChannel.set(fn, channel);
   const handler = makeRpcHandler(
     { [CALL]: fn as (...args: never[]) => unknown },
     ctx.registry,
@@ -140,19 +141,6 @@ function encode(fn: AnyFunction, ctx: EncodeContext): unknown {
   channel.onMessage((message) => {
     const frame = message as CallbackFrame;
     if (frame.type === "call") {
-      if (fnRef.deref() === undefined) {
-        // The callback function was released: the reference's address died.
-        channel.send(
-          {
-            type: "result",
-            id: frame.id,
-            ok: false,
-            error: serializeError(new Error("Callback has been released")),
-          } satisfies CallbackFrame,
-        );
-        channel.close();
-        return;
-      }
       void handler(frame).then((res) => {
         if (res.ok) {
           channel.send(
@@ -186,8 +174,21 @@ function encode(fn: AnyFunction, ctx: EncodeContext): unknown {
   } satisfies CallbackHandle;
 }
 
-/** Owner-side fn weak-ref map: channel → WeakRef(fn), for release semantics. */
-const fnByChannel = new WeakMap<Channel, WeakRef<AnyFunction>>();
+// Owner-side strong hold: while a callback channel is open, the owner holds
+// the function strongly (alive during caller use); closing the channel drops
+// it. Release (releaseCallback) closes the channel, so the function and its
+// closure become collectable — aligned with the ref conditional-strong model.
+const fnByChannel = new Map<Channel, AnyFunction>();
+const fnChannel = new WeakMap<AnyFunction, Channel>();
+
+/** Owner-side explicit release: the actor decides its callback dies. */
+export function releaseCallback(fn: AnyFunction): void {
+  const channel = fnChannel.get(fn);
+  if (channel) {
+    channel.send({ type: "released" } satisfies CallbackFrame);
+    channel.close(); // onClosed drops the strong hold
+  }
+}
 
 function decode(
   placeholder: CallbackHandle,
@@ -217,6 +218,12 @@ function decode(
   channel.onMessage((message) => {
     const frame = message as CallbackFrame;
     if (frame.type === "result") proxy.deliver(frame);
+    else if (frame.type === "released") {
+      // The owner released the callback: die immediately (no round trip).
+      proxy.rejectAll(new Error("Callback released by its owner"));
+      channel.close();
+      dropProxy(state, cb);
+    }
   });
   let unregisterRelease: () => void = () => {};
 
