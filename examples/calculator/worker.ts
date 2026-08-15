@@ -186,6 +186,18 @@ export const rpc = {
     return cb("hello");
   },
 
+  /** Async callback that rejects: the worker's await must see a RemoteError. */
+  callAsyncRejectingCallback(
+    cb: (x: number) => Promise<number>,
+  ): Promise<unknown> {
+    // The worker awaits the callback; a rejection is caught here and returned
+    // as the error value — proving the reject traveled back across the channel.
+    return cb(1).then(
+      (v) => v,
+      (e) => e,
+    );
+  },
+
   /** Nested field: a function inside an object also travels byref automatically. */
   callNestedCallback(opts: { onDone: (v: number) => string }): Promise<string> {
     return Promise.resolve(opts.onDone(7));

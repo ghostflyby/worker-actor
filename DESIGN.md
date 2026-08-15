@@ -223,6 +223,14 @@ machinery of the main channel and links:
   marshals the call; the promise stays a real promise (await/.catch work);
   `dispose()` releases it.
 
+**Async callbacks and awaiting results**: a callback reference is typed
+`(...args) => Promise<Awaited<R>>`, and the owner side awaits the function
+(`makeRpcHandler` awaits `fn(...args)`), so "wait for the callback to finish and
+use its return value" works naturally — a worker writes `const r = await cb(x)`
+and the final value (or a `RemoteError` for a rejection) arrives back. Only the
+awaiting method suspends; the worker event loop keeps processing other messages.
+Not awaiting yields a Promise, exactly like native async semantics.
+
 Lifecycle matches remote-ref: explicit `dispose()`, GC-based release
 (FinalizationRegistry, best-effort), and failAll (the registry closes the
 channel). Callbacks are **behavior, not identity**: there is no refId, hand-off,

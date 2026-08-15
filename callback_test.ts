@@ -41,6 +41,20 @@ Deno.test("callback: async callback result is awaited across the channel", async
   await actor.dispose();
 });
 
+Deno.test("callback: async callback rejection surfaces as RemoteError at the worker's await", async () => {
+  const actor = await makeActor();
+  const outcome = await actor.callAsyncRejectingCallback(async (x: number) => {
+    await sleep(5);
+    throw new RangeError(`async boom ${x}`);
+  });
+  // worker awaited the callback; the rejection crossed the channel and was
+  // caught there, returned as the error value.
+  assertInstanceOf(outcome, RemoteError);
+  assertEquals(outcome.name, "RangeError");
+  assert(outcome.message.includes("async boom"));
+  await actor.dispose();
+});
+
 Deno.test("callback: nested function field travels byref automatically", async () => {
   const actor = await makeActor();
   const result = await actor.callNestedCallback({
