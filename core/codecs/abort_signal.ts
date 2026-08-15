@@ -15,12 +15,22 @@
  * Channel protocol:
  *   sender → receiver  { type: "status"; aborted; reason? }   // initial state
  *   sender → receiver  { type: "abort"; reason? }             // abort propagation
+ *   receiver → sender  { type: "release" }                    // rebuilt signal was GC'd
  *
  * Semantics:
  *   - On failAll (actor terminated/crashed) the receiver-side rebuilt signal is
  *     aborted too — cancels long-running work within the actor context.
  *   - The aborted state lands asynchronously (within a tick); event-driven
  *     consumers are unaffected.
+ *   - GC-based release is NOT applicable to AbortSignal: abort propagation
+ *     requires holding the rebuilt AbortController, and an AbortController
+ *     strongly references its signal (controller.signal), which would pin the
+ *     signal forever and never fire a finalizer. Release is therefore driven by
+ *     explicit frames only: abort/status teardown and failAll. A "release"
+ *     frame handler is kept defensively for forward compatibility.
+ *   - Sender and receiver both self-remove from the codec's bookkeeping once
+ *     their channel is done, so ports/listeners don't linger past the signal's
+ *     lifetime.
  */
 
 import {
@@ -32,7 +42,7 @@ import {
 } from "../codec.ts";
 
 interface AbortFrame {
-  type: "status" | "abort";
+  type: "status" | "abort" | "release";
   aborted?: boolean;
   reason?: unknown;
 }
@@ -43,11 +53,11 @@ interface AbortSignalHandle {
 }
 
 interface AbortCodecState {
-  /** sender 侧清理函数（停发 + 移除监听 + 关 port1）。 */
+  /** Sender-side cleanup (stop forwarding, remove listener, close port1). */
   senders: Set<() => void>;
-  /** receiver 侧 abort 函数（actor 死亡时取消重建信号）。 */
+  /** Receiver-side abort on failAll (cancels the rebuilt signal). */
   receivers: Set<() => void>;
-  /** 已转移给对端的 port2，failAll 时兜底关闭。 */
+  /** port2 transferred to the peer; closed as a safety net on failAll. */
   port2s: Set<MessagePort>;
 }
 
@@ -76,18 +86,25 @@ function encode(signal: AbortSignal, ctx: EncodeContext): unknown {
 
   const onAbort = (): void => {
     post({ type: "abort", reason: signal.reason });
-    stopped = true; // propagates once; the port is closed right after
-    port1.close();
+    cleanup();
   };
-  if (!signal.aborted) {
-    signal.addEventListener("abort", onAbort, { once: true });
-  }
 
-  state.senders.add(() => {
+  // cleanup self-removes from the registry, so the source signal's graph is
+  // collectable once the channel is done, even while the actor stays alive.
+  let cleanup: () => void = () => {};
+  cleanup = (): void => {
+    if (stopped) return;
     stopped = true;
     signal.removeEventListener("abort", onAbort);
     port1.close();
-  });
+    state.senders.delete(cleanup);
+    state.port2s.delete(port2);
+  };
+
+  if (!signal.aborted) {
+    signal.addEventListener("abort", onAbort, { once: true });
+  }
+  state.senders.add(cleanup);
   state.port2s.add(port2);
   ctx.transfer.push(port2);
   return {
@@ -103,6 +120,19 @@ function decode(
   const controller = new AbortController();
   const state = getState(ctx);
   const port = placeholder.port;
+  let closed = false;
+
+  // teardown is the single idempotent release path; abortLocal decides whether
+  // the rebuilt signal is also aborted (failAll / deserialization error) or the
+  // channel is just torn down (peer aborted or released).
+  const failAllCleanup = (): void => teardown(true);
+  function teardown(abortLocal: boolean): void {
+    if (closed) return;
+    closed = true;
+    port.close();
+    state.receivers.delete(failAllCleanup);
+    if (abortLocal && !controller.signal.aborted) controller.abort();
+  }
 
   port.onmessage = (ev: MessageEvent<AbortFrame>) => {
     const frame = ev.data;
@@ -112,18 +142,14 @@ function decode(
       }
     } else if (frame.type === "abort") {
       if (!controller.signal.aborted) controller.abort(frame.reason);
-      port.close();
+      teardown(false);
+    } else if (frame.type === "release") {
+      teardown(false);
     }
   };
-  port.onmessageerror = () => {
-    if (!controller.signal.aborted) controller.abort();
-    port.close();
-  };
+  port.onmessageerror = () => teardown(true);
 
-  state.receivers.add(() => {
-    if (!controller.signal.aborted) controller.abort();
-    port.close();
-  });
+  state.receivers.add(failAllCleanup);
 
   return controller.signal;
 }

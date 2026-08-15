@@ -10,7 +10,7 @@
  *   - Natively cloneable containers (arrays/Map/Set/TypedArray/ArrayBuffer) don't
  *     match this codec and travel via structured clone as-is.
  *
- * Channel protocol and semantics (lazy/backpressure/cancel/error/death) are
+ * Channel protocol and semantics (lazy/backpressure/release/error/death) are
  * implemented by core/stream.ts primitives; this codec only does matching and
  * placeholder translation.
  *
@@ -38,6 +38,15 @@ interface IterableCodecState {
   producerStops: Set<() => void>;
   consumerFails: Set<() => void>;
 }
+
+/**
+ * Finalizer for rebuilt iterables: when one is garbage-collected on this side,
+ * tell the producer side (via the stream's own channel) to release the original
+ * object graph. Best-effort only — explicit return()/done/error/fail are the
+ * deterministic release paths; the finalizer never holds a strong ref to the
+ * registered target.
+ */
+const releaseRegistry = new FinalizationRegistry<() => void>((fn) => fn());
 
 function isAsyncIterable(v: unknown): v is AsyncIterable<unknown> {
   return (
@@ -96,10 +105,17 @@ function encode(value: AsyncIterable<unknown>, ctx: EncodeContext): unknown {
     ? value
     : toAsyncIterable(value as Iterable<unknown>);
   const { port1, port2 } = new MessageChannel();
-  const stop = startStreamProducer(port1, iterable);
   const state = getState(ctx);
+  // stopFn self-removes from the registry once the stream ends (done/error/
+  // release), so the original iterable's object graph becomes collectable even
+  // while the actor stays alive.
+  let stopFn: () => void = () => {};
+  stopFn = startStreamProducer(port1, iterable, () => {
+    state.producerStops.delete(stopFn);
+    state.activePorts.delete(port2);
+  });
   state.activePorts.add(port2);
-  state.producerStops.add(stop);
+  state.producerStops.add(stopFn);
   ctx.transfer.push(port2);
   return {
     [CODEC_PLACEHOLDER_KEY]: "iterable",
@@ -111,10 +127,25 @@ function decode(
   placeholder: { port: MessagePort },
   ctx: DecodeContext,
 ): AsyncIterable<unknown> {
-  const { iterable, fail } = createRemoteIterable(placeholder.port);
   const state = getState(ctx);
+  let failFn: () => void = () => {};
+  const token = {};
+  const { iterable, fail, detach } = createRemoteIterable(
+    placeholder.port,
+    () => {
+      state.consumerFails.delete(failFn);
+      releaseRegistry.unregister(token);
+    },
+  );
+  failFn = fail;
+  state.consumerFails.add(failFn);
   state.activePorts.delete(placeholder.port);
-  state.consumerFails.add(fail);
+  // Best-effort release on GC: the finalizer only captures the port and detach —
+  // never the iterable itself — so it cannot keep the target alive.
+  releaseRegistry.register(iterable as object, () => {
+    placeholder.port.postMessage({ type: "release" });
+    detach();
+  }, token);
   return iterable;
 }
 

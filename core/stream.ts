@@ -8,12 +8,13 @@
  *   consumer → producer  { type: "start" }    lazy start on first next(); no iteration, no producer work
  *   producer → consumer  { type: "item", value } | { type: "done" } | { type: "error", error }
  *   consumer → producer  { type: "cancel" }    early stop; triggers the producer's generator finally
+ *   consumer → producer  { type: "release" }   consumer GC'd/abandoned the stream; producer releases
  *
  * Semantics:
  *   - Lazy: iteration starts only after "start".
  *   - Backpressure: items are delivered only while the consumer's next() is pending;
  *     the generator awaits between messages.
- *   - Cancel: "cancel" calls iterator.return() (runs generator finally).
+ *   - Cancel/release: calls iterator.return() (runs generator finally).
  *   - Death: fail() from createRemoteIterable rejects all pending next() calls.
  */
 
@@ -29,15 +30,18 @@ type StreamFrame =
   | { type: "item"; value: unknown }
   | { type: "done" }
   | { type: "error"; error: SerializedError }
-  | { type: "cancel" };
+  | { type: "cancel" }
+  | { type: "release" };
 
 /**
  * Producer side: pump an AsyncIterable into the channel. The returned stop()
- * cancels/closes and is safe to call repeatedly.
+ * cancels/closes and is safe to call repeatedly. onStopped fires exactly once
+ * (on the first stop) and lets the caller remove registry bookkeeping.
  */
 export function startStreamProducer(
   port: MessagePort,
   iterable: AsyncIterable<unknown>,
+  onStopped?: () => void,
 ): () => void {
   const iterator = iterable[Symbol.asyncIterator]();
   let started = false;
@@ -50,7 +54,7 @@ export function startStreamProducer(
         started = true;
         void pump();
       }
-    } else if (frame.type === "cancel") {
+    } else if (frame.type === "cancel" || frame.type === "release") {
       stop();
     }
   };
@@ -61,6 +65,8 @@ export function startStreamProducer(
     port.close();
     const ret = iterator.return?.();
     if (ret) void ret.catch(() => {});
+    // Self-remove from the codec's bookkeeping; idempotent thanks to `stopped`.
+    onStopped?.();
   }
 
   async function pump(): Promise<void> {
@@ -93,17 +99,27 @@ export function startStreamProducer(
 /**
  * Consumer side: rebuild a local AsyncIterable from the channel.
  * fail() rejects all pending next() calls when the actor dies, so they don't hang.
+ * onReleased fires exactly once (when the stream ends by any path: done/error,
+ * explicit return(), or fail) and lets the caller remove registry bookkeeping.
  */
 export function createRemoteIterable(
   port: MessagePort,
-): { iterable: AsyncIterable<unknown>; fail: () => void } {
+  onReleased?: () => void,
+): { iterable: AsyncIterable<unknown>; fail: () => void; detach: () => void } {
   const queue: StreamFrame[] = [];
   const waiters: Array<{
     resolve: (result: IteratorResult<unknown>) => void;
     reject: (reason: unknown) => void;
   }> = [];
   let closed = false;
+  let released = false;
   let failure: SerializedError | undefined;
+
+  const detach = (): void => {
+    if (released) return;
+    released = true;
+    onReleased?.();
+  };
 
   const deliver = (frame: StreamFrame): void => {
     const waiter = waiters.shift();
@@ -132,6 +148,7 @@ export function createRemoteIterable(
       if (frame.type === "error") failure = frame.error;
       closed = true;
       port.close();
+      detach();
     }
   };
   port.onmessageerror = () => {
@@ -142,6 +159,7 @@ export function createRemoteIterable(
     closed = true;
     port.close();
     deliver({ type: "error", error: failure });
+    detach();
   };
 
   const fail = (): void => {
@@ -153,6 +171,7 @@ export function createRemoteIterable(
       const waiter = waiters.shift()!;
       waiter.reject(new RemoteError(failure!));
     }
+    detach();
   };
 
   const toResult = (frame: StreamFrame): IteratorResult<unknown> => {
@@ -180,14 +199,18 @@ export function createRemoteIterable(
           );
         },
         return(): Promise<IteratorResult<unknown>> {
-          port.postMessage({ type: "cancel" } satisfies StreamFrame);
+          // Explicit abandon: tell the producer to release, then detach locally.
+          // A finalizer path (see the iterable codec) may also send "release";
+          // stop() on the producer side is idempotent.
+          port.postMessage({ type: "release" } satisfies StreamFrame);
           port.close();
           closed = true;
+          detach();
           return Promise.resolve({ done: true, value: undefined });
         },
       };
     },
   };
 
-  return { iterable, fail };
+  return { iterable, fail, detach };
 }

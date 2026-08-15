@@ -202,3 +202,78 @@ Deno.test("codec: stream error still surfaces as RemoteError", async () => {
   assert((outcome as RemoteError).message.includes("stream exploded"));
   await actor.dispose();
 });
+
+// —— GC-based release (FinalizationRegistry) ——
+
+// gc() is only available under `deno test --v8-flags=--expose-gc`; without it the
+// GC-based tests skip the parts that need a forced collection (finalizers are
+// best-effort by spec, so the deterministic paths are covered by the tests above).
+const forceGc = (globalThis as { gc?: () => void }).gc;
+
+async function yieldToEventLoop(times: number): Promise<void> {
+  for (let i = 0; i < times; i++) await new Promise((r) => setTimeout(r, 1));
+}
+
+Deno.test("gc: abandoned remote iterable releases the producer on the other side", async () => {
+  const actor = await spawnCalculator();
+  // The worker keeps a counter of generator-finally runs; a release triggered by
+  // the main side GC must reach the worker and run the producer's finally.
+  assertEquals(await actor.getStreamCancelCount(), 0);
+  // Get, start, then abandon the stream inside a completed async IIFE: while the
+  // outer test function is still running, `await` keeps its promise (and the
+  // resolved iterable) alive until the frame exits — a bare block isn't enough.
+  await (async () => {
+    const stream = await actor.infiniteStream();
+    const it = stream[Symbol.asyncIterator]();
+    // Start the generator so it suspends on its first yield: an async generator
+    // never entered via next() skips its finally when return() is called later.
+    const first = await it.next();
+    assertEquals(first.done, false);
+  })(); // IIFE completed: its frame and all resolved values are collectable
+  if (forceGc) {
+    // give the finalizer a chance to fire, then force a collection
+    await yieldToEventLoop(4);
+    forceGc();
+    const deadline = Date.now() + 5_000;
+    let cancels = 0;
+    while (Date.now() < deadline) {
+      cancels = await actor.getStreamCancelCount();
+      if (cancels > 0) break;
+      forceGc();
+      await yieldToEventLoop(4);
+    }
+    // under --expose-gc the chain (finalizer → release → producer stop →
+    // generator finally) must actually fire; best-effort only applies without gc()
+    assertEquals(cancels, 1);
+  } else {
+    // no forced GC available: the mechanism can't be exercised, so just verify
+    // the stream object itself is dropable without side effects
+    console.log(
+      "  (skipped forced collection: run with --v8-flags=--expose-gc)",
+    );
+  }
+  await actor.dispose();
+});
+
+Deno.test("gc: explicit return() keeps the release single (no double notify)", async () => {
+  const actor = await spawnCalculator();
+  const stream = await actor.infiniteStream();
+  const it = stream[Symbol.asyncIterator]();
+  await it.next();
+  await it.return?.(); // explicit abandon: sends release and unregisters the finalizer
+  const deadline = Date.now() + 2_000;
+  let cancels = 0;
+  while (Date.now() < deadline) {
+    cancels = await actor.getStreamCancelCount();
+    if (cancels >= 1) break;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  assertEquals(cancels, 1);
+  if (forceGc) {
+    forceGc();
+    await yieldToEventLoop(4);
+  }
+  // even after collection, the release must not fire twice
+  assertEquals(await actor.getStreamCancelCount(), 1);
+  await actor.dispose();
+});
