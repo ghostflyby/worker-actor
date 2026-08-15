@@ -1,6 +1,12 @@
 /** Example worker for the custom marshal-by-ref codec. */
 import { serveWorker } from "../../mod.ts";
-import { type RemoteRef, remoteRef, remoteRefCodec } from "./ref_codec.ts";
+import {
+  isRemoteRef,
+  ownerChannelCountFor,
+  type RemoteRef,
+  remoteRef,
+  remoteRefCodec,
+} from "./ref_codec.ts";
 
 /** How many real objects were released via [Symbol.dispose] — observable probe. */
 let disposedCount = 0;
@@ -33,9 +39,27 @@ class Counter {
   }
 }
 
+/** One shared Counter: repeated remoteRef() calls reuse its identity. */
+const shared = new Counter();
+
 export const rpc = {
   createCounter(): RemoteRef<Counter> {
     return remoteRef(new Counter());
+  },
+  sharedCounter(): RemoteRef<Counter> {
+    return remoteRef(shared);
+  },
+  /** Accept a reference back into this worker (which may be the owner). */
+  acceptBack(ref: RemoteRef<unknown>): string {
+    return isRemoteRef(ref) ? "proxy" : "local";
+  },
+  /** If the returned ref restored the owner's object, calling it runs locally. */
+  callBack(ref: RemoteRef<unknown>): Promise<number> {
+    return (ref as RemoteRef<{ increment(): Promise<number> }>).increment();
+  },
+  /** Probe: owner-side channels for `shared` (closed on restore). */
+  sharedOwnerChannels(): number {
+    return ownerChannelCountFor(shared);
   },
   disposedCount(): number {
     return disposedCount;

@@ -141,3 +141,24 @@ Deno.test("link rpc: bidirectional — B calls C's served surface", async () => 
   await actorB.dispose();
   await actorC.dispose();
 });
+
+// —— Reference round-trip over the link: B→C→B restores at the owner ——
+
+Deno.test("link ref round-trip: B hands shared ref to C, C hands it back, B restores", async () => {
+  const { actorB, actorC } = await spawnLinked();
+  await actorB.sendSharedToC(); // B's shared Counter ref → C over the link
+  const gotRef = await waitFor(() => actorC.getLastIsRef());
+  assert(gotRef, "C should receive the reference over the link");
+  assertEquals(await actorC.callLastIncrement(), 1); // executes in B
+
+  // C hands the same reference back to B over the link → B restores it locally.
+  assertEquals(await actorC.returnSharedToB(), "local");
+
+  // B still owns the same object: a fresh ref round-trips again and increments.
+  await actorB.sendSharedToC();
+  await waitFor(() => actorC.getLastIsRef());
+  assertEquals(await actorC.callLastIncrement(), 2);
+
+  await actorB.dispose();
+  await actorC.dispose();
+});

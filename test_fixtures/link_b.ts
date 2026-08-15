@@ -4,6 +4,7 @@ import type { LinkHandle } from "../worker_runtime.ts";
 import type { PeerRpc } from "../core/rpc.ts";
 import type { CPeerApi } from "./link_c.ts"; // type-only: no runtime import cycle
 import {
+  isRemoteRef,
   type RemoteRef,
   remoteRef,
   remoteRefCodec,
@@ -46,6 +47,12 @@ export const rpc = {
   callCPing(): Promise<string> {
     return (linkHandle!.rpc as unknown as CPeerApi).ping();
   },
+  /** Send the shared Counter's reference to C over the link (fresh owner token). */
+  sendSharedToC(): string {
+    if (!linkHandle) throw new Error("link not established");
+    linkHandle.send(remoteRef(sharedCounter));
+    return "sent";
+  },
 };
 
 /**
@@ -63,7 +70,14 @@ export const peerApi = {
   describe(): string {
     return "b";
   },
+  /** Accept a reference that traveled back (C → B): restored or still proxy? */
+  acceptRef(ref: RemoteRef<unknown>): string {
+    return isRemoteRef(ref) ? "proxy" : "local";
+  },
 };
+
+/** A Counter shared across refs so the test can observe identity/restore. */
+const sharedCounter = new Counter();
 
 /** Contract type for B's served surface, exported for C's calls. */
 export type BPeerApi = PeerRpc<typeof peerApi>;

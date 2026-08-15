@@ -31,6 +31,8 @@ export interface ChannelOptions {
 
 export interface Channel {
   readonly closed: boolean;
+  /** The underlying MessagePort; transferring it to a peer moves the channel (reference hand-off). */
+  readonly port: MessagePort;
   /** Send a frame to the peer; transferable ports/buffers go in the second argument. */
   send(message: unknown, transfer?: Transferable[]): void;
   /** Register the inbound frame handler (a second call replaces the first). */
@@ -72,13 +74,21 @@ function wrapPort(port: MessagePort, options: ChannelOptions = {}): Channel {
   const close = (): void => {
     if (closed) return;
     closed = true;
-    port.close();
+    try {
+      port.close();
+    } catch {
+      // The port may already be detached by a transfer (reference hand-off);
+      // close() on a detached port throws — closing is still "done".
+    }
     options.onClosed?.();
   };
 
   return {
     get closed(): boolean {
       return closed;
+    },
+    get port(): MessagePort {
+      return port;
     },
     send(message: unknown, transfer?: Transferable[]): void {
       if (closed) return;

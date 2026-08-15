@@ -48,6 +48,13 @@ export const rpc = {
     })
       .getDisposedCount();
   },
+  /** Hand the reference received from B back to B over the link (round-trip). */
+  returnSharedToB(): Promise<string> {
+    return (linkHandle!.rpc as unknown as {
+      acceptRef(ref: unknown): Promise<string>;
+    })
+      .acceptRef(lastValue);
+  },
 };
 
 /** Peer-facing surface: what worker B may call on C over the link. */

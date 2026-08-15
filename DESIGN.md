@@ -225,6 +225,26 @@ dedicated channel, errors serialized back, dispose/GC release, nested streams
 flowing through reference results). It is an example, not a built-in — the
 library stays protocol-agnostic.
 
+**Reference identity and restore** (the ActorRef semantics):
+
+- Every real object has a stable **refId** (registered on the owner side, with a
+  random per-process prefix so ids never collide across workers). Repeating
+  `remoteRef(x)` reuses the identity; a receiver dedupes by refId, so two refs
+  to the same object compare equal and share one proxy.
+- Handing a reference over is a **hand-off**: the identity travels on, and the
+  previous holder's channel is closed (per-holder connection to the owner). The
+  previous proxy becomes dead — the reference is single-holder at any time.
+- A reference that travels back to its **owner** is **restored**: the owner
+  recognizes the refId, collapses it into a local call-through reference (no
+  proxy, no channel — method calls run directly on the real object) and closes
+  the channels still open for it. This works after any number of hand-offs:
+  identity travels, the owner recognizes it home.
+- Only the owner can produce fresh references; a proxy holder can only hand the
+  reference along. A refId-only hand-off arriving at a non-owner is refused
+  loudly (the holder cannot re-establish the owner connection for a third
+  party). Channels are therefore never transferred — the reference is the
+  identity, not the wire.
+
 ### Direct worker-to-worker links
 
 A worker cannot talk to another worker directly (DedicatedWorker has no peer
@@ -251,9 +271,9 @@ surfaces as send errors / delivery failure), recorded as a limitation.
 
 Constraints: both link endpoints must register a compatible codec set for the
 values they exchange (a mismatch fails loudly on decode, like the RPC
-handshake); only fresh tokens can be transmitted — a received reference proxy is
-not re-encodable (references are owned by their creator, mirroring the ActorRef
-semantics of "references cannot be serialized").
+handshake). References travel over links by identity (see the restore semantics
+above): a holder may hand a reference along, and only the owner can produce
+fresh ones.
 
 **Direct peer RPC over links** is implemented and reuses the same machinery as
 the main channel: `core/rpc.ts` provides channel-agnostic factories —

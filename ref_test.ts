@@ -123,3 +123,44 @@ Deno.test("remote ref: GC of the proxy releases the owner (best-effort)", async 
   assertEquals(disposed, 1);
   await actor.dispose();
 });
+
+// —— Identity & restore semantics ——
+
+Deno.test("identity: same object refs reuse one proxy (refs are comparable)", async () => {
+  const actor = await spawnRefActor();
+  const r1 = await actor.sharedCounter();
+  const r2 = await actor.sharedCounter();
+  assertEquals(r1, r2); // same refId → same proxy on this side
+  assertEquals(await (r1 as RemoteRef<CounterRef>).increment(), 1);
+  assertEquals(await (r2 as RemoteRef<CounterRef>).get(), 1); // same underlying object
+  await actor.dispose();
+});
+
+Deno.test("restore: reference back to owner collapses to a local direct call", async () => {
+  const actor = await spawnRefActor();
+  const r1 = await actor.sharedCounter() as RemoteRef<CounterRef>;
+  assertEquals(await r1.increment(), 1); // shared counter in the worker → 1
+  // Handing the ref back to its owner restores it (no proxy, no channel).
+  assertEquals(await actor.acceptBack(r1), "local");
+  // The restored ref calls the real object directly: a fresh ref round-trips
+  // again and increments the same counter → 2.
+  assertEquals(
+    await actor.callBack(await actor.sharedCounter() as RemoteRef<CounterRef>),
+    2,
+  );
+  // Restoring closed the owner-side channels for the shared counter.
+  assertEquals(await actor.sharedOwnerChannels(), 0);
+  await actor.dispose();
+});
+
+Deno.test("transfer: the original proxy dies after its port is handed off", async () => {
+  const actor = await spawnRefActor();
+  const r1 = await actor.sharedCounter() as RemoteRef<CounterRef>;
+  await actor.acceptBack(r1); // r1's underlying port was transferred back
+  const outcome = await r1.increment().then(
+    () => "unexpectedly resolved" as const,
+    (e: unknown) => e,
+  );
+  assert(outcome instanceof Error);
+  await actor.dispose();
+});
