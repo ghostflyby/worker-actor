@@ -34,10 +34,10 @@
  */
 
 import {
-  Codec,
+  type Codec,
   CODEC_PLACEHOLDER_KEY,
-  DecodeContext,
-  EncodeContext,
+  type DecodeContext,
+  type EncodeContext,
   getCodecState,
 } from "../codec.ts";
 import { connectChannel, openChannel } from "../channel.ts";

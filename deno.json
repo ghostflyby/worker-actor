@@ -1,4 +1,6 @@
 {
+  "name": "@ghostflyby/worker-actor",
+  "license": "Apache-2.0",
   "tasks": {
     "demo": "deno run --allow-read examples/calculator/main.ts",
     "demo:ref": "deno run --allow-read examples/remote_ref/main.ts",

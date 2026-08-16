@@ -19,7 +19,7 @@
  * travel as plain structured-clone values.
  */
 
-import { Codec, CODEC_PLACEHOLDER_KEY } from "../codec.ts";
+import { type Codec, CODEC_PLACEHOLDER_KEY } from "../codec.ts";
 import { RemoteError } from "../protocol.ts";
 
 export interface ErrorCodecOptions {

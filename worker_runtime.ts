@@ -19,7 +19,7 @@
  *   - Exceptions inside the worker are serialized back and rebuilt as RemoteError.
  */
 
-import { Frame, PROTOCOL_VERSION } from "./core/protocol.ts";
+import { type Frame, PROTOCOL_VERSION } from "./core/protocol.ts";
 import { type Codec, PayloadCodecRegistry } from "./core/codec.ts";
 import { type Channel, connectChannel } from "./core/channel.ts";
 import {

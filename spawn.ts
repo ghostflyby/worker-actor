@@ -11,7 +11,11 @@
  *   const sum = await actor.add(1, 2); // sum: number, type-safe
  */
 
-import { ActorDiedError, Frame, PROTOCOL_VERSION } from "./core/protocol.ts";
+import {
+  ActorDiedError,
+  type Frame,
+  PROTOCOL_VERSION,
+} from "./core/protocol.ts";
 import { type Codec, PayloadCodecRegistry } from "./core/codec.ts";
 import { createRpcProxy } from "./core/rpc.ts";
 import type { TransformCallbacks } from "./core/type-utils.ts";
