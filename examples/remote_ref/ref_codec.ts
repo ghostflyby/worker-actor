@@ -51,7 +51,6 @@ import {
   type DecodeContext,
   type EncodeContext,
   getActiveRegistry,
-  getCodecState,
   openChannel,
   registerControlHandler,
   registerRelease,
@@ -563,12 +562,20 @@ interface PendingEntry {
   calls: PendingCall[];
   registry: DecodeContext["registry"];
   refId: string;
-  /** The materialized real proxy once the acquire completes; later calls forward here. */
+  /** The materialized real proxy once a port arrives; later calls forward here. */
   real?: RemoteRef<unknown>;
 }
 
 // Module-level pending registry (worker/main: single-threaded, race-free).
 const pendingByRefId = new Map<string, PendingEntry>();
+
+// Context-wide identity: every arrival for a refId — fresh token or refId-only
+// hand-off, through ANY registry of this context — resolves to ONE entity.
+// Module-global like pendingByRefId: identity is a property of the context
+// (thread), not of a single spawn registry (spawn creates one registry per
+// worker, and refs flow across them). WeakRef values so a dropped proxy is
+// still collectable (the dedupe must not pin the GC-release path).
+const identityByRefId = new Map<string, WeakRef<RemoteRef<unknown>>>();
 
 function createPendingProxy(
   refId: string,
@@ -577,25 +584,24 @@ function createPendingProxy(
   const existing = pendingByRefId.get(refId);
   if (existing) return existing.proxy;
   const calls: PendingCall[] = [];
-  const registry = ctx.registry;
   const entry: PendingEntry = {
     proxy: undefined as never,
     calls,
-    registry,
+    registry: ctx.registry,
     refId,
   };
   const proxy = new Proxy({} as RemoteRef<unknown>, {
     get(_target, prop) {
       if (prop === REF_PROXY_BRAND) return true;
       if (prop === REF_ID) return refId;
-      if (prop === "dispose") return () => disposePending(refId, calls);
+      if (prop === "dispose") return () => disposePending(entry);
       if (prop === Symbol.dispose) {
-        return () => void disposePending(refId, calls);
+        return () => void disposePending(entry);
       }
       if (prop === "then") return undefined;
       if (typeof prop === "string") {
         return (...args: unknown[]) => {
-          // Once acquired, forward to the real proxy (later calls must not
+          // Once materialized, forward to the real proxy (later calls must not
           // queue into the already-flushed pending list).
           if (entry.real) {
             return (entry.real as unknown as Record<
@@ -620,16 +626,67 @@ function createPendingProxy(
   return proxy;
 }
 
-function disposePending(refId: string, calls: PendingCall[]): Promise<void> {
-  pendingByRefId.delete(refId);
-  for (const c of calls) {
+function disposePending(entry: PendingEntry): Promise<void> {
+  // Materialized: disposing the entity disposes the real proxy (which closes
+  // the channel and rejects in-flight calls).
+  if (entry.real) entry.real.dispose();
+  pendingByRefId.delete(entry.refId);
+  identityByRefId.delete(entry.refId);
+  for (const c of entry.calls) {
     c.reject(new Error("Remote ref disposed before acquire completed"));
   }
-  calls.length = 0;
+  entry.calls.length = 0;
   return Promise.resolve();
 }
 
-/** __ref-acquired: a port for the pending ref arrived — materialize and flush. */
+/**
+ * Materialize a pending entry: a port for the ref arrived (a direct fresh
+ * token, or the acquire-completion port). The pending proxy stays the single
+ * entity for this refId — later calls forward to the real proxy — and is
+ * recorded in the dedupe table, so ANY later arrival path (direct token or
+ * refId-only hand-off) returns the same object. Identity is path-independent.
+ */
+function materialize(
+  entry: PendingEntry,
+  port: MessagePort,
+  liveness?: { ownerId?: string; livenessPort?: MessagePort },
+): void {
+  if (entry.real) {
+    port.close(); // already materialized: the extra port is redundant
+    return;
+  }
+  const registry = entry.registry;
+  const channel = connectChannel(port);
+  registry.registerChannel(channel);
+  const pair = liveness
+    ? ensureHolderPair(liveness.ownerId, liveness.livenessPort)
+    : undefined;
+  const real = createRefProxy(channel, registry, entry.refId, () => {
+    // The real proxy's death does not end the ENTITY: identityByRefId keeps
+    // pointing at the pending proxy (the single entity), whose dispose is the
+    // entity's lifetime. Nothing to clean here.
+  });
+  // When the OWNER dies (reverse detection: its pings stop), this proxy — and
+  // every other proxy of that owner — fails together; no calls hang forever.
+  pair?.kills.add(() => {
+    real.dispose();
+  });
+  entry.real = real;
+  pendingByRefId.delete(entry.refId);
+  identityByRefId.set(entry.refId, new WeakRef(entry.proxy));
+  const calls = entry.calls;
+  entry.calls = [];
+  for (const c of calls) {
+    const p =
+      (real as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>)
+        [
+          c.method
+        ](...c.args);
+    p.then(c.resolve, c.reject);
+  }
+}
+
+/** __ref-acquired: the acquire-completion port arrived — materialize and flush. */
 function onRefAcquiredInner(
   frame: {
     refId: string;
@@ -643,29 +700,10 @@ function onRefAcquiredInner(
     frame.port.close();
     return;
   }
-  pendingByRefId.delete(frame.refId);
-  const channel = connectChannel(frame.port);
-  entry.registry.registerChannel(channel);
-  const pair = ensureHolderPair(frame.ownerId, frame.livenessPort);
-  const real = createRefProxy(channel, entry.registry, entry.refId, () => {
-    // proxy released: no dedupe table entry to clean (pending was removed).
+  materialize(entry, frame.port, {
+    ownerId: frame.ownerId,
+    livenessPort: frame.livenessPort,
   });
-  // When the OWNER dies (reverse detection: its pings stop), this proxy — and
-  // every other proxy of that owner — fails together; no calls hang forever.
-  pair?.kills.add(() => {
-    real.dispose();
-  });
-  entry.real = real; // later calls on the pending proxy forward here
-  const calls = entry.calls;
-  entry.calls = [];
-  for (const c of calls) {
-    const p =
-      (real as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>)
-        [
-          c.method
-        ](...c.args);
-    p.then(c.resolve, c.reject);
-  }
 }
 
 /** __serve-ref: the owner must register a fresh per-holder channel for this ref. */
@@ -734,15 +772,6 @@ registerControlHandler("__serve-ref", onServeRefFrame);
 // the main-side codec's module graph consistent (the notice frame is routed to
 // every module instance).
 registerControlHandler("__holder-dead", onHolderDead);
-
-interface RefCodecState {
-  /**
-   * Dedupe per receiver: the same refId (same identity) reuses one proxy.
-   * WeakRef values so a dropped proxy can still be garbage-collected (the GC
-   * release path must not be pinned by the dedupe table).
-   */
-  proxyByRefId: Map<string, WeakRef<RemoteRef<unknown>>>;
-}
 
 /**
  * Register an owner-side channel for a refId. Cleanup on close is wired via
@@ -842,6 +871,22 @@ export const remoteRefCodec: Codec<RemoteRef<unknown>> = {
       port?.close();
       return createLocalRef(obj);
     }
+    // Identity is path- and registry-independent: every arrival for a refId
+    // (fresh token or refId-only hand-off, through any spawn registry of this
+    // context) resolves to ONE entity via the module-level identity table.
+    // `===` therefore holds across all arrival paths.
+    const existing = identityByRefId.get(refId)?.deref();
+    if (existing) {
+      port?.close(); // entity exists (pending or direct): extra port is redundant
+      return existing;
+    }
+    const entry = pendingByRefId.get(refId);
+    if (entry) {
+      // Already known as a pending (refId-only) arrival: attach this direct
+      // port if one arrived — the pending proxy becomes the single entity.
+      if (port !== undefined) materialize(entry, port);
+      return entry.proxy;
+    }
     if (port === undefined) {
       // A refId-only hand-off arrived at a non-owner. The identity travels;
       // the channel is a per-holder connection that must be established via
@@ -849,29 +894,30 @@ export const remoteRefCodec: Codec<RemoteRef<unknown>> = {
       // a pending proxy: its first call triggers the acquire.
       return createPendingProxy(refId, ctx);
     }
-    // Receiver side: the same identity reuses one proxy (refs are comparable).
-    const state = getCodecState<RefCodecState>(ctx, remoteRefCodec, () => ({
-      proxyByRefId: new Map(),
-    }));
-    const existing = state.proxyByRefId.get(refId)?.deref();
-    if (existing) {
-      port.close();
-      return existing;
-    }
+    // First direct arrival: create the entity and register it in the identity
+    // table (subsequent arrivals of any path return the same object).
     const channel = connectChannel(port);
     ctx.registry.registerChannel(channel);
     const proxy = createRefProxy(channel, ctx.registry, refId, () => {
-      state.proxyByRefId.delete(refId);
+      identityByRefId.delete(refId);
     });
-    state.proxyByRefId.set(refId, new WeakRef(proxy));
+    identityByRefId.set(refId, new WeakRef(proxy));
     return proxy;
   },
-  onRegistryFail(state: RefCodecState | undefined): void {
-    if (!state) return;
-    for (const weakRef of state.proxyByRefId.values()) {
+  onRegistryFail(): void {
+    // failAll: every live entity of this context dies. The module-level
+    // identity table holds exactly the context's entities (pending or direct);
+    // open channels are closed by the registry's failAll() via registerChannel.
+    for (const weakRef of identityByRefId.values()) {
       weakRef.deref()?.dispose();
     }
-    state.proxyByRefId.clear();
-    // open channels are closed by the registry's failAll() via registerChannel.
+    identityByRefId.clear();
+    for (const entry of pendingByRefId.values()) {
+      for (const c of entry.calls) {
+        c.reject(new Error("Remote ref garbage-collected"));
+      }
+      entry.calls.length = 0;
+    }
+    pendingByRefId.clear();
   },
 };

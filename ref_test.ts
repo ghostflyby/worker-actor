@@ -152,6 +152,26 @@ Deno.test("identity: same object refs reuse one proxy (refs are comparable)", as
   await actor.dispose();
 });
 
+Deno.test("identity: ref equality holds across arrival paths (direct ↔ hand-off)", async () => {
+  // Same context, same refId, two different arrival paths: a fresh token
+  // (direct port) and a refId-only hand-off (B returns the ref). Both must
+  // resolve to the SAME entity — `===` is the identity contract.
+  const actor = await spawnRefActor();
+  await actor.disposedCount(); // warm up: routeable refId prefix
+  const direct = await actor.sharedCounter() as RemoteRef<CounterRef>;
+  const holder = await spawnHolder();
+  await holder.holdRef(direct);
+  const handedBack = await holder.getHeldRef();
+  // Strict identity across paths: the hand-off did not create a second proxy.
+  assertEquals(handedBack, direct);
+  assert(handedBack === direct);
+  // The single entity is usable and reaches the same underlying object.
+  assertEquals(await (handedBack as RemoteRef<CounterRef>).increment(), 1);
+  assertEquals(await (direct as RemoteRef<CounterRef>).get(), 1);
+  await actor.dispose();
+  await holder.dispose();
+});
+
 Deno.test("restore: reference back to owner collapses to a local direct call", async () => {
   const actor = await spawnRefActor();
   const r1 = await actor.sharedCounter() as RemoteRef<CounterRef>;
@@ -246,6 +266,9 @@ Deno.test("acquire: multi-hop sharing A→main→B→C all reach the same owner 
   // B → C: B returns its held proxy; the main thread re-encodes it as a
   // refId token (sharing) and hands it to C.
   const refViaB = await b.getHeldRef();
+  // The ref that traveled out and came back is the SAME entity on main
+  // (refId-only hand-off resolves to the existing direct proxy).
+  assert(refViaB === refFromA);
   const c = await spawn<typeof RefWorkerModule.rpc>(
     new Worker(REF_WORKER_URL, { type: "module" }),
     { codecs: [remoteRefCodec] },
