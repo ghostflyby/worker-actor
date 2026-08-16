@@ -1,0 +1,41 @@
+name: Publish
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: "2.x"
+
+      - name: Run tests
+        run: deno test --allow-read
+
+      - name: Verify tag == version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          VERSION="v$(deno eval 'console.log(JSON.parse(Deno.readTextFileSync("deno.json")).version)')"
+          if [ "$TAG" != "$VERSION" ]; then
+            echo "tag=$TAG deno.json.version=$VERSION — mismatch, update one to match"
+            exit 1
+          fi
+
+      - name: Publish to JSR
+        run: deno publish
+
+      - name: Create GitHub Release
+        run: |
+          gh release create "${GITHUB_REF#refs/tags/}" \
+            --title "${GITHUB_REF#refs/tags/}" \
+            --generate-notes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

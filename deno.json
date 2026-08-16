@@ -1,6 +1,21 @@
 {
   "name": "@ghostflyby/worker-actor",
+  "version": "0.1.0",
   "license": "Apache-2.0",
+  "publish": {
+    "exclude": [
+      ".github/",
+      ".gitignore",
+      ".zcode/",
+      "DESIGN.md",
+      "OWNERSHIP.md",
+      "PLUGIN-SYSTEM.md",
+      "deno.lock",
+      "examples/",
+      "test_fixtures/",
+      "**/*_test.ts"
+    ]
+  },
   "tasks": {
     "demo": "deno run --allow-read examples/calculator/main.ts",
     "demo:ref": "deno run --allow-read examples/remote_ref/main.ts",
