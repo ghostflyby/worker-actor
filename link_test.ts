@@ -1,7 +1,6 @@
 import { assert, assertEquals, assertInstanceOf } from "@std/assert";
-import { link, spawn } from "./spawn.ts";
+import { link, RemoteError, spawn } from "@ghostflyby/worker-actor";
 import { remoteRefCodec } from "./examples/remote_ref/ref_codec.ts";
-import { RemoteError } from "./core/protocol.ts";
 import type * as LinkBModule from "./test_fixtures/link_b.ts";
 import type * as LinkCModule from "./test_fixtures/link_c.ts";
 

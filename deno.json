@@ -27,11 +27,6 @@
   "exports": {
     ".": "./mod.ts",
     "./codec": "./codec.ts",
-    "./channel": "./channel.ts",
-    "./rpc": "./rpc.ts",
-    "./stream": "./stream.ts",
-    "./codecs": "./codecs.ts",
-    "./types": "./types.ts",
-    "./protocol": "./protocol.ts"
+    "./codecs": "./codecs.ts"
   }
 }

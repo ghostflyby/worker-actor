@@ -1,5 +1,5 @@
 import { assert, assertEquals, assertInstanceOf } from "@std/assert";
-import { spawn } from "./spawn.ts";
+import { spawn } from "@ghostflyby/worker-actor";
 import type * as CalcWorkerModule from "./examples/calculator/worker.ts";
 
 const CALC_URL = import.meta.resolve("./examples/calculator/worker.ts");

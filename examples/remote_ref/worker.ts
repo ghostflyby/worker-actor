@@ -1,5 +1,5 @@
 /** Example worker for the custom marshal-by-ref codec. */
-import { serveWorker } from "../../mod.ts";
+import { serveWorker } from "@ghostflyby/worker-actor";
 import {
   isRemoteRef,
   ownerChannelCountFor,

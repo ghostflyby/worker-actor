@@ -1,6 +1,6 @@
 /** Test-only worker: minimal RPC surface for exercising the codec mechanism. */
-import { serveWorker } from "../mod.ts";
-import type { Codec } from "../codec.ts";
+import { serveWorker } from "@ghostflyby/worker-actor";
+import type { Codec } from "@ghostflyby/worker-actor/codec";
 
 // User-defined codec: takes over any object with an asyncIterator, wrapping it
 // as a capsule instead of opening a channel. It registers before the built-in

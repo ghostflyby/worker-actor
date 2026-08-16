@@ -43,25 +43,22 @@
  */
 
 import {
+  type Channel,
   type Codec,
   CODEC_PLACEHOLDER_KEY,
+  connectChannel,
+  type ControlFrame,
   type DecodeContext,
   type EncodeContext,
-  getCodecState,
-} from "../../core/codec.ts";
-import {
-  type Channel,
-  connectChannel,
-  openChannel,
-  registerRelease,
-} from "../../core/channel.ts";
-import {
-  type ControlFrame,
   getActiveRegistry,
+  getCodecState,
+  openChannel,
   registerControlHandler,
+  registerRelease,
+  serializeError,
   triggerAcquire,
-} from "../../core/worker-context.ts";
-import { RemoteError, serializeError } from "../../core/protocol.ts";
+} from "@ghostflyby/worker-actor/codec";
+import { RemoteError } from "@ghostflyby/worker-actor";
 
 // Deno types `self` as Window; in a worker it is a DedicatedWorkerGlobalScope.
 // Only postMessage is used here (the liveness death notice goes to main).

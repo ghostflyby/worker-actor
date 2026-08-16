@@ -1,6 +1,6 @@
 /** Main-thread demo: `deno run examples/remote_ref/main.ts` */
 import type * as WorkerModule from "./worker.ts";
-import { spawn } from "../../mod.ts";
+import { spawn } from "@ghostflyby/worker-actor";
 import { type RemoteRef, remoteRefCodec } from "./ref_codec.ts";
 
 const actor = await spawn<typeof WorkerModule.rpc>(

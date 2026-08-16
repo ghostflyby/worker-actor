@@ -1,6 +1,9 @@
 import { assert, assertEquals, assertInstanceOf } from "@std/assert";
-import { type ActorPool, createActorPool } from "./pool.ts";
-import { ActorDiedError } from "./core/protocol.ts";
+import {
+  ActorDiedError,
+  type ActorPool,
+  createActorPool,
+} from "@ghostflyby/worker-actor";
 import type * as WorkerModule from "./examples/calculator/worker.ts";
 
 const WORKER_URL = import.meta.resolve("./examples/calculator/worker.ts");

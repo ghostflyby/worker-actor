@@ -1,7 +1,6 @@
 /** Test fixture: worker C — receives B's reference over the link, and sends one back. */
-import { serveWorker } from "../mod.ts";
-import type { LinkHandle } from "../worker_runtime.ts";
-import type { PeerRpc } from "../core/rpc.ts";
+import { type LinkHandle, serveWorker } from "@ghostflyby/worker-actor";
+import type { PeerRpc } from "@ghostflyby/worker-actor/codec";
 import type { BPeerApi } from "./link_b.ts"; // type-only: no runtime import cycle
 import {
   isRemoteRef,

@@ -1,7 +1,6 @@
 /** Test fixture: worker B — holds a real Counter object and hands its reference to C over the link. */
-import { serveWorker } from "../mod.ts";
-import type { LinkHandle } from "../worker_runtime.ts";
-import type { PeerRpc } from "../core/rpc.ts";
+import { type LinkHandle, serveWorker } from "@ghostflyby/worker-actor";
+import type { PeerRpc } from "@ghostflyby/worker-actor/codec";
 import type { CPeerApi } from "./link_c.ts"; // type-only: no runtime import cycle
 import {
   isRemoteRef,

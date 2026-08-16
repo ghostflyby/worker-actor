@@ -1,6 +1,6 @@
 /** Main-thread demo: `deno run examples/calculator/main.ts` */
 import type * as WorkerModule from "./worker.ts";
-import { spawn } from "../../spawn.ts";
+import { spawn } from "@ghostflyby/worker-actor";
 
 const actor = await spawn<typeof WorkerModule.rpc>(
   new Worker(import.meta.resolve("./worker.ts"), { type: "module" }),

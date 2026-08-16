@@ -22,7 +22,7 @@ jobs:
 
       - name: Type-check all modules, examples and fixtures
         run: |
-          deno check mod.ts codec.ts channel.ts rpc.ts stream.ts codecs.ts types.ts protocol.ts core/ examples/ test_fixtures/
+          deno check mod.ts codec.ts codecs.ts core/ examples/ test_fixtures/
 
       - name: Lint
         run: deno lint .

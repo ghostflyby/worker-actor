@@ -1,6 +1,5 @@
 import { assert, assertEquals, assertInstanceOf } from "@std/assert";
-import { RemoteError } from "./core/protocol.ts";
-import { spawn } from "./spawn.ts";
+import { RemoteError, spawn } from "@ghostflyby/worker-actor";
 import {
   type RemoteRef,
   remoteRefCodec,

@@ -4,16 +4,18 @@ import {
   assertInstanceOf,
   assertThrows,
 } from "@std/assert";
-import { RemoteError } from "./core/protocol.ts";
+import { RemoteError, spawn } from "@ghostflyby/worker-actor";
 import {
   type Codec,
   CODEC_PLACEHOLDER_KEY,
   PayloadCodecRegistry,
-} from "./core/codec.ts";
-import { iterableCodec } from "./core/codecs/iterable.ts";
-import { createErrorCodec, errorCodec } from "./core/codecs/error.ts";
-import { abortSignalCodec } from "./core/codecs/abort_signal.ts";
-import { spawn } from "./spawn.ts";
+} from "@ghostflyby/worker-actor/codec";
+import {
+  abortSignalCodec,
+  createErrorCodec,
+  errorCodec,
+  iterableCodec,
+} from "@ghostflyby/worker-actor/codecs";
 import type * as FixtureModule from "./test_fixtures/codec_worker.ts";
 import type * as WorkerModule from "./examples/calculator/worker.ts";
 

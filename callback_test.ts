@@ -1,6 +1,5 @@
 import { assert, assertEquals, assertInstanceOf } from "@std/assert";
-import { spawn } from "./spawn.ts";
-import { RemoteError } from "./core/protocol.ts";
+import { RemoteError, spawn } from "@ghostflyby/worker-actor";
 import type * as WorkerModule from "./examples/calculator/worker.ts";
 
 const WORKER_URL = import.meta.resolve("./examples/calculator/worker.ts");

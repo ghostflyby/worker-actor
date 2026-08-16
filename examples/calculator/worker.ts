@@ -1,6 +1,5 @@
 /** Example worker: the exported rpc object is the Actor's API surface. */
-import { serveWorker } from "../../worker_runtime.ts";
-import type { RemoteCallback } from "../../core/codecs/callback.ts";
+import { type RemoteCallback, serveWorker } from "@ghostflyby/worker-actor";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
