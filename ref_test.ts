@@ -27,9 +27,11 @@ async function yieldToEventLoop(times: number): Promise<void> {
 }
 
 function spawnRefActor() {
+  // `as const` makes the codec tuple's value type drive the type projection:
+  // createCounter() is typed RemoteRef<...> directly (no cast needed).
   return spawn<typeof RefWorkerModule.rpc>(
     new Worker(REF_WORKER_URL, { type: "module" }),
-    { codecs: [remoteRefCodec] },
+    { codecs: [remoteRefCodec] as const },
   );
 }
 
@@ -37,7 +39,7 @@ function spawnRefActor() {
 function spawnHolder() {
   return spawn<typeof RefWorkerModule.rpc>(
     new Worker(REF_WORKER_URL, { type: "module" }),
-    { codecs: [remoteRefCodec] },
+    { codecs: [remoteRefCodec] as const },
   );
 }
 

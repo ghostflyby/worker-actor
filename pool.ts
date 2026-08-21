@@ -33,14 +33,19 @@ import { ActorDiedError } from "./core/protocol.ts";
 import type { Codec } from "./core/codec.ts";
 import { attachLazyIterator, spawn } from "./spawn.ts";
 import type { ActorHandle, Remote } from "./spawn.ts";
+import type { CodecValueTypes } from "./core/type-utils.ts";
 
-export interface ActorPoolOptions {
+export interface ActorPoolOptions<
+  C extends readonly Codec<unknown>[] = readonly Codec<unknown>[],
+> {
   /** Number of members. Default 1. */
   size?: number;
   /** Factory for a member's Worker; called once per member (and per replace). */
   spawnWorker: () => Worker;
-  /** Codecs passed to every member's spawn (per-member handshake fingerprint). */
-  codecs?: Codec<unknown>[];
+  /** Codecs passed to every member's spawn (per-member handshake fingerprint).
+   *  An `as const` tuple also drives the type projection of each member's
+   *  Remote<T> surface, exactly like spawn's codecs option. */
+  codecs?: C;
   /** Creation interruption passed to every member's spawn. */
   signal?: AbortSignal | null;
   /** Member selection strategy. Default "round-robin". */
@@ -54,7 +59,7 @@ export interface ActorPoolOptions {
   onMemberDead?: (index: number, reason: unknown) => void;
 }
 
-export type ActorPool<T> = Remote<T> & {
+export type ActorPool<T, Pass extends unknown = never> = Remote<T, Pass> & {
   /** Terminate every member; idempotent. Calls after dispose reject. */
   dispose(): Promise<void>;
   /** Number of live members. */
@@ -67,9 +72,9 @@ export type ActorPool<T> = Remote<T> & {
   invokeOn(index: number, method: string, args: unknown[]): Promise<unknown>;
 };
 
-interface Member<T> {
+interface Member<T, Pass extends unknown = never> {
   /** The spawned actor; undefined until spawn() resolves. */
-  actor?: Remote<T> & ActorHandle;
+  actor?: Remote<T, Pass> & ActorHandle;
   /** Resolves when this slot's spawn() settles (success or failure). */
   ready: Promise<void>;
   inFlight: number;
@@ -79,23 +84,29 @@ interface Member<T> {
 
 const EMPTY: unique symbol = Symbol("pool-empty");
 
-export function createActorPool<T>(options: ActorPoolOptions): ActorPool<T> {
+export function createActorPool<
+  T,
+  const C extends readonly Codec<unknown>[] = readonly Codec<unknown>[],
+>(
+  options: ActorPoolOptions<C>,
+): ActorPool<T, CodecValueTypes<C>> {
   const size = options.size ?? 1;
   // Every index keeps a stable slot; an actor arrives asynchronously via
   // spawn(). A slot that is still spawning (actor undefined) is treated as
   // live-but-not-ready: routing skips it; once ready it joins routing.
-  const members: (Member<T> | typeof EMPTY)[] = Array(size).fill(EMPTY);
+  const members: (Member<T, CodecValueTypes<C>> | typeof EMPTY)[] = Array(size)
+    .fill(EMPTY);
   let disposed = false;
   let rrCursor = 0;
 
   const spawnMember = (index: number): void => {
-    const slot: Member<T> = {
+    const slot: Member<T, CodecValueTypes<C>> = {
       inFlight: 0,
       dead: false,
       ready: Promise.resolve(),
     };
     members[index] = slot;
-    const ready = spawn<T>(options.spawnWorker(), {
+    const ready = spawn<T, C>(options.spawnWorker(), {
       codecs: options.codecs,
       signal: options.signal,
       onDeath: (reason) => {

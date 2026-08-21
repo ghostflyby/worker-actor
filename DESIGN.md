@@ -105,42 +105,72 @@ await actor.dispose();
 
 ## Type design (the static-typing core)
 
+The proxy call is always a native Promise at runtime, and the RPC handler
+`await`s the worker method's return value before encoding it. The projection
+therefore describes **what that Promise resolves to** — the value that actually
+crosses the boundary — never a nested async wrapper. Rules, in order:
+
 ```ts
-export type Remote<T> = {
-  [K in keyof T]: T[K] extends (...args: infer A) => AsyncIterable<infer E>
-    ? (...args: A) => AsyncIterable<E>
-    : T[K] extends RpcFn ? (
-        ...args: TransformCallbacks<Parameters<T[K]>>
-      ) => Promise<Resolved<ReturnType<T[K]>>>
+export type Remote<T, Pass extends unknown = never> = {
+  [K in keyof T]: T[K] extends (...args: infer A) => never
+    ? (...args: A) => Promise<never>
+    : T[K] extends (...args: infer A) => infer R
+      ? R extends Pass ? (...args: TransformCallbacks<A>) => R
+      : R extends PromiseLike<infer X>
+        ? (...args: TransformCallbacks<A>) => Promise<X>
+      : R extends AsyncIterable<infer E>
+        ? (...args: TransformCallbacks<A>) => AsyncIterable<E>
+      : T[K] extends RpcFn ? (
+          ...args: TransformCallbacks<Parameters<T[K]>>
+        ) => Promise<Resolved<ReturnType<T[K]>>>
+      : never
     : never;
 };
 ```
 
-- Only function members survive; non-function members resolve to `never` (a
+- **Codec pass-through** (`R extends Pass`): a return type covered by a runtime
+  codec is kept exactly as declared — the codec rebuilds that type on the far
+  side, so full identity survives. `Pass` is derived from the `as const`
+  `codecs` tuple via `CodecValueTypes`:
+  ```ts
+  const codecs = [remoteRefCodec] as const; // Codec<RemoteRef<unknown>>
+  spawn<typeof rpc>(worker, { codecs });
+  // worker: createCounter(): RemoteRef<CounterRef>  →  stays RemoteRef<CounterRef>
+  ```
+  A `Codec<unknown>` entry (an empty generic, e.g. a widened array) contributes
+  nothing (`never`) — a `Pass` of `unknown` would swallow every return type — so
+  untyped codecs fall back to the built-in async rules below, still honest.
+- **Thenable** (`R extends PromiseLike<infer X>`): a native `Promise<V>`, a
+  custom thenable `MyTask<R>`, an explicit `Promise<AsyncIterable<E>>`, or a
+  thenable-stream hybrid all map to `() => Promise<X>`. The handler awaits the
+  value, so what crosses is the resolution `X` — never a nested Promise. (An
+  explicit `Promise<AsyncIterable<E>>` keeps its eager Promise because `X` is
+  itself `AsyncIterable<E>`; a hybrid keeps its thenable side, the runtime
+  ordering being await-first.)
+- **Iterable** (`R extends AsyncIterable<infer E>`): maps to
+  `() =>
+  AsyncIterable<E>` — the stream is its own async semantics, no Promise
+  wrapper (lazy: the first `next()` triggers the remote call; the call stays a
+  real promise underneath, its attached iterator resolving it). Custom
+  `AsyncIterable` subclasses flatten to the interface.
+- **Fallback**: every other function member → `Promise<Resolved<R>>` (sync
+  returns normalize to a Promise). Non-function members resolve to `never` (a
   mistyped field fails immediately at compile time).
-- A method returning `AsyncIterable<E>` maps to `() => AsyncIterable<E>` — the
-  stream is its own async semantics, so the outer Promise is dropped. The call
-  stays a real promise underneath (await/.catch work); its attached iterator
-  resolves it on the first `next()` and forwards the inner remote stream.
-  Element-level laziness is preserved by the iterable codec (the worker-side
-  generator only runs after the first `start` frame). An explicit
-  `Promise<AsyncIterable<E>>` keeps its eager Promise — the writer spelled that
-  intent out, so it is not flattened.
-- **Callback parameters are projected through `TransformCallbacks`** (the single
-  type-projection point, `core/type-utils.ts`): a worker declaring
+- **Parameters** are projected through `TransformCallbacks` in every branch (the
+  single type-projection point, `core/type-utils.ts`): a worker declaring
   `cb: (x) => Promise<R>` keeps its honest runtime shape, while the CALLING side
-  may pass a sync or an async function (`R | Promise<R>`) — top-level
-  parameters, nested object fields and array elements all widen
-  deep-recursively. Built-in containers (Map/Set/Date/AsyncIterable/Promise/
-  ArrayBuffer/views) pass through unchanged, and predicate/edge function shapes
-  are preserved, so `Codec.matches` and friends are never mapped into empty
-  objects. The worker-side declaration is untouched; only the caller-facing
-  parameter type changes.
-- Return values are normalized to Promise; single-parameter `Promise`
-  (`Awaited`) flattens automatically, no recursive types.
+  may pass a sync or an async function (`R | Promise<R>`). Built-in containers
+  (Map/Set/Date/AsyncIterable/Promise/ArrayBuffer/views) pass through unchanged,
+  and predicate/edge function shapes are preserved.
 - Callers always write `spawn<typeof WorkerModule.rpc>` and never a second
   interface definition — the worker is the source of type truth.
 - The proxy additionally exposes `dispose(): Promise<void>`.
+
+**Honesty note**: a projected type describes the resolution of the native
+Promise the proxy returns. Non-async members of a passed-through type are
+preserved only if the codec actually rebuilds them on the far side (e.g. a
+`RemoteRef` proxy's methods); a structured-cloned resolution value carries only
+its cloneable surface.
 
 ## Transport design (deep values + AsyncIterable + Codec mechanism)
 
