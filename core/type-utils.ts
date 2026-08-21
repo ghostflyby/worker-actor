@@ -23,6 +23,8 @@
  *   - tuples keep their length/optionality through the mapped array branch.
  */
 
+import type { Codec } from "./codec.ts";
+
 /** Widen one Promise-returning function to accept sync or async callers. */
 type AcceptSyncOrAsync<F> = F extends (...args: infer A) => Promise<infer R>
   ? (...args: A) => R | Promise<R>
@@ -48,3 +50,33 @@ export type TransformCallbacks<T> = T extends Promise<unknown> ? T
 export type SyncOrAsync<A extends unknown[] = unknown[], R = unknown> = (
   ...args: A
 ) => R | Promise<R>;
+
+/**
+ * A return type whose async semantics are already declared by the worker: it
+ * implements PromiseLike (awaitable) OR AsyncIterable (iterable). Remote<T>
+ * treats such a return type as "the writer already said how it behaves" and
+ * projects it to a non-nested native Promise (thenable side: the RPC handler
+ * awaits the method's return value, so the crossing value is the resolution
+ * X) or to the AsyncIterable<E> interface (iterable side: the iterable codec
+ * rebuilds a local stream on the far side).
+ */
+export type AsyncSemantics = PromiseLike<unknown> | AsyncIterable<unknown>;
+
+/**
+ * Extract the value types of a const codec tuple, so a runtime `codecs`
+ * registration is reflected in the type projection:
+ *
+ *   const codecs = [remoteRefCodec] as const;  // Codec<RemoteRef<unknown>>
+ *   CodecValueTypes<typeof codecs>             // RemoteRef<unknown>
+ *
+ * Entries typed `Codec<unknown>` (an empty generic, e.g. a widened array) are
+ * filtered out: a Pass of `unknown` would swallow every return type, so an
+ * untyped codec contributes nothing and the projection falls back to the
+ * built-in async rules — still honest, just not identity-preserving.
+ */
+export type CodecValueTypes<C extends readonly unknown[]> = C extends
+  readonly [infer Head, ...infer Tail] ?
+    | (Head extends Codec<infer V> ? [unknown] extends [V] ? never : V
+      : never)
+    | CodecValueTypes<Tail>
+  : never;

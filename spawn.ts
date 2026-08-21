@@ -18,7 +18,7 @@ import {
 } from "./core/protocol.ts";
 import { type Codec, PayloadCodecRegistry } from "./core/codec.ts";
 import { createRpcProxy } from "./core/rpc.ts";
-import type { TransformCallbacks } from "./core/type-utils.ts";
+import type { CodecValueTypes, TransformCallbacks } from "./core/type-utils.ts";
 import {
   type ControlFrame,
   dispatchControlFrame,
@@ -39,31 +39,53 @@ export type RpcFn = (...args: any[]) => any;
 type Resolved<T> = T extends Promise<unknown> ? Awaited<T> : T;
 
 /**
- * Derives the remote proxy type from the worker-side API shape:
- *   - a method returning AsyncIterable<E> directly maps to () => AsyncIterable<E>
- *     — the stream is its own async semantics, no Promise wrapper (lazy: the
- *     first next() triggers the remote call);
- *   - an explicit Promise<AsyncIterable<E>> keeps its eager Promise (await
- *     works), because the writer spelled out that intent;
- *   - every other function member returns a Promise. Parameter types are
- *     projected through TransformCallbacks: a Promise-returning function
- *     parameter (the worker's honest declaration) widens to `R | Promise<R>`
- *     on the calling side, so BOTH sync and async functions can be passed;
- *   - non-function members (constants, classes, ...) resolve to never and fail
- *     at compile time.
+ * Derives the remote proxy type from the worker-side API shape. Each method's
+ * return type is projected so the caller sees an honest shape for the value
+ * that actually crosses the boundary — the proxy call is always a native
+ * Promise at runtime, and the RPC handler `await`s the worker method's return
+ * value before encoding it. Rules, in order:
+ *
+ *   1. never-returning (throwing) methods → Promise<never> (must come first:
+ *      never structurally matches PromiseLike).
+ *   2. A return type covered by a runtime codec (`Pass`, derived from the
+ *      const `codecs` tuple via CodecValueTypes) → kept exactly as declared:
+ *      the codec rebuilds that type on the far side, so full identity survives.
+ *   3. A PromiseLike<X> return type (native Promise, a custom thenable, an
+ *      explicit Promise<AsyncIterable<E>>, or a thenable-stream hybrid) →
+ *      Promise<X>: the handler awaits the value, so what crosses is the
+ *      resolution X — never a nested Promise.
+ *   4. A bare AsyncIterable<E> return type → AsyncIterable<E>: the iterable
+ *      codec rebuilds a local stream (lazy: the first next() triggers the
+ *      remote call). Custom AsyncIterable subclasses flatten to the interface.
+ *   5. Every other function member → Promise<Resolved<R>> (sync returns
+ *      normalize to a Promise).
+ *   6. Non-function members (constants, classes, ...) → never, failing at
+ *      compile time.
+ *
+ * Parameters are projected through TransformCallbacks in every branch: a
+ * Promise-returning function parameter (the worker's honest declaration)
+ * widens to `R | Promise<R>` on the calling side, so BOTH sync and async
+ * functions can be passed.
  */
-export type Remote<T> = {
+export type Remote<T, Pass extends unknown = never> = {
   [K in keyof T]: T[K] extends (...args: infer A) => never
-    ? (...args: A) => Promise<never> // never-returning (throwing) methods: never matches AsyncIterable
-    : T[K] extends (...args: infer A) => AsyncIterable<infer E>
-      ? (...args: A) => AsyncIterable<E>
-    : T[K] extends RpcFn ? (
-        ...args: TransformCallbacks<Parameters<T[K]>>
-      ) => Promise<Resolved<ReturnType<T[K]>>>
+    ? (...args: A) => Promise<never>
+    : T[K] extends (...args: infer A) => infer R
+      ? R extends Pass ? (...args: TransformCallbacks<A>) => R // codec rebuilds R on the far side: keep identity
+      : R extends PromiseLike<infer X>
+        ? (...args: TransformCallbacks<A>) => Promise<X> // handler awaits: crossing value is X
+      : R extends AsyncIterable<infer E>
+        ? (...args: TransformCallbacks<A>) => AsyncIterable<E>
+      : T[K] extends RpcFn ? (
+          ...args: TransformCallbacks<Parameters<T[K]>>
+        ) => Promise<Resolved<ReturnType<T[K]>>>
+      : never
     : never;
 };
 
-export interface SpawnOptions {
+export interface SpawnOptions<
+  C extends readonly Codec<unknown>[] = readonly Codec<unknown>[],
+> {
   /**
    * Interruption policy for creation (the handshake):
    *   - omitted (undefined): default 10s timeout
@@ -81,8 +103,14 @@ export interface SpawnOptions {
    * Built-ins: iterable / error / abort-signal / callback. Both sides must
    * register the same tag list; the handshake validates it and a mismatch
    * kills the actor.
+   *
+   * The const tuple also drives the type projection: a return type covered by
+   * a registered codec (CodecValueTypes<C>) is kept exactly as declared on
+   * the Remote<T> proxy, because that codec rebuilds it on the far side.
+   * Pass an `as const` tuple to opt in; a plain array or Codec<unknown>
+   * entries fall back to the built-in async projection rules.
    */
-  codecs?: Codec<unknown>[];
+  codecs?: C;
   /**
    * Fired when the actor dies through the kill() path: a worker crash, a
    * handshake failure (version/codec mismatch, timeout, interrupted creation).
@@ -247,10 +275,13 @@ export function link(a: Worker, b: Worker, label: string): () => void {
   };
 }
 
-export async function spawn<T>(
+export async function spawn<
+  T,
+  const C extends readonly Codec<unknown>[] = readonly Codec<unknown>[],
+>(
   worker: Worker,
-  options: SpawnOptions = {},
-): Promise<Remote<T> & ActorHandle> {
+  options: SpawnOptions<C> = {},
+): Promise<Remote<T, CodecValueTypes<C>> & ActorHandle> {
   // Constraint: the worker handshake is not buffered — call spawn() right after
   // `new Worker(...)`. If messages arrive before the onmessage handler below is
   // set (e.g. another await in between), the handshake is lost and spawn()

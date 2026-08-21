@@ -17,7 +17,9 @@
  *   control         — the acquire control plane (registerControlHandler /
  *                     triggerAcquire / ...) for main-coordinated references
  *   protocol        — serializeError / SerializedError for error frames
- *   types           — TransformCallbacks / SyncOrAsync for remote type projections
+ *   types           — TransformCallbacks / SyncOrAsync / CodecValueTypes
+ *                     for remote type projections (CodecValueTypes derives
+ *                     the pass-through set from a runtime codec tuple)
  *
  * @see examples/remote_ref/ref_codec.ts — a full custom codec built on these.
  */
@@ -69,4 +71,8 @@ export type { ControlFrame } from "./core/worker-context.ts";
 export { serializeError } from "./core/protocol.ts";
 export type { SerializedError } from "./core/protocol.ts";
 
-export type { SyncOrAsync, TransformCallbacks } from "./core/type-utils.ts";
+export type {
+  CodecValueTypes,
+  SyncOrAsync,
+  TransformCallbacks,
+} from "./core/type-utils.ts";
