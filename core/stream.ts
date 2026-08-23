@@ -85,7 +85,9 @@ export function startStreamProducer(
           break;
         }
         if (encode === undefined) {
-          channel.send({ type: "item", value: result.value } satisfies StreamFrame);
+          channel.send(
+            { type: "item", value: result.value } satisfies StreamFrame,
+          );
         } else {
           const encoded = encode(result.value);
           channel.send(
