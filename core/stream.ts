@@ -36,11 +36,18 @@ type StreamFrame =
  * Producer side: pump an AsyncIterable into a channel. The returned stop()
  * cancels/closes and is safe to call repeatedly. onStopped fires exactly once
  * (on the first stop) and lets the caller remove registry bookkeeping.
+ *
+ * When `encode` is given, every item is passed through it before sending, so
+ * codec values (actor references, nested AsyncIterables) travel as encoded
+ * placeholders instead of being structured-cloned (which would fail for
+ * proxies). The default sends items as-is. `encode` returns the encoded value
+ * plus any transferable ports to move with the message.
  */
 export function startStreamProducer(
   channel: Channel,
   iterable: AsyncIterable<unknown>,
   onStopped?: () => void,
+  encode?: (value: unknown) => { value: unknown; transfer: Transferable[] },
 ): () => void {
   const iterator = iterable[Symbol.asyncIterator]();
   let started = false;
@@ -77,9 +84,15 @@ export function startStreamProducer(
           channel.send({ type: "done" } satisfies StreamFrame);
           break;
         }
-        channel.send(
-          { type: "item", value: result.value } satisfies StreamFrame,
-        );
+        if (encode === undefined) {
+          channel.send({ type: "item", value: result.value } satisfies StreamFrame);
+        } else {
+          const encoded = encode(result.value);
+          channel.send(
+            { type: "item", value: encoded.value } satisfies StreamFrame,
+            encoded.transfer,
+          );
+        }
       }
     } catch (e) {
       if (!stopped) {
@@ -103,10 +116,15 @@ export function startStreamProducer(
  * fail() rejects all pending next() calls when the actor dies, so they don't hang.
  * onReleased fires exactly once (when the stream ends by any path: done/error,
  * explicit return(), or fail) and lets the caller remove registry bookkeeping.
+ *
+ * When `decode` is given, every item's value is passed through it before
+ * delivery, rebuilding codec values (actor references, nested AsyncIterables)
+ * that the producer encoded.
  */
 export function createRemoteIterable(
   channel: Channel,
   onReleased?: () => void,
+  decode?: (value: unknown) => unknown,
 ): { iterable: AsyncIterable<unknown>; fail: () => void; detach: () => void } {
   const queue: StreamFrame[] = [];
   const waiters: Array<{
@@ -135,7 +153,10 @@ export function createRemoteIterable(
       return;
     }
     if (frame.type === "item") {
-      waiter.resolve({ done: false, value: frame.value });
+      waiter.resolve({
+        done: false,
+        value: decode === undefined ? frame.value : decode(frame.value),
+      });
     } else if (frame.type === "done") {
       waiter.resolve({ done: true, value: undefined });
     } else if (frame.type === "error") {
@@ -167,7 +188,12 @@ export function createRemoteIterable(
   };
 
   const toResult = (frame: StreamFrame): IteratorResult<unknown> => {
-    if (frame.type === "item") return { done: false, value: frame.value };
+    if (frame.type === "item") {
+      return {
+        done: false,
+        value: decode === undefined ? frame.value : decode(frame.value),
+      };
+    }
     if (frame.type === "done") return { done: true, value: undefined };
     if (frame.type === "error") throw new RemoteError(frame.error);
     return { done: true, value: undefined }; // start/release never appear in the consumer queue
