@@ -104,21 +104,9 @@ function encode(value: AsyncIterable<unknown>, ctx: EncodeContext): unknown {
   // release), so the original iterable's object graph becomes collectable even
   // while the actor stays alive.
   let stopFn: () => void = () => {};
-  stopFn = startStreamProducer(
-    channel,
-    iterable,
-    () => {
-      state.producerStops.delete(stopFn);
-    },
-    // Encode every item through the registry so codec values (actor references,
-    // nested AsyncIterables) travel as placeholders instead of failing
-    // structured clone (proxies cannot be cloned). The transfer list carries
-    // any ports the encode created (e.g. an actor ref's channel).
-    (value) => {
-      const transfer: Transferable[] = [];
-      return { value: ctx.registry.encode(value, transfer), transfer };
-    },
-  );
+  stopFn = startStreamProducer(channel, iterable, () => {
+    state.producerStops.delete(stopFn);
+  });
   state.producerStops.add(stopFn);
   return {
     [CODEC_PLACEHOLDER_KEY]: "iterable",
@@ -141,9 +129,6 @@ function decode(
       state.consumerFails.delete(failFn);
       unregister(); // explicit path: done/error/return/fail — no GC release later
     },
-    // Decode every item through the registry, rebuilding codec values (actor
-    // references, nested AsyncIterables) the producer encoded.
-    (value) => ctx.registry.decode(value),
   );
   failFn = fail;
   state.consumerFails.add(failFn);
