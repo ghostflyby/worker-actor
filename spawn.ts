@@ -28,6 +28,8 @@ import { iterableCodec } from "./core/codecs/iterable.ts";
 import { errorCodec } from "./core/codecs/error.ts";
 import { abortSignalCodec } from "./core/codecs/abort_signal.ts";
 import { callbackCodec } from "./core/codecs/callback.ts";
+import { fromMessagePort, type Transport } from "./core/transport.ts";
+import { triggerAcquire } from "./core/worker-context.ts";
 
 // The RPC boundary is inherently dynamic: type safety comes from Remote<T>
 // deriving the worker's concrete signatures, and this any only serves shape
@@ -129,15 +131,19 @@ const HANDSHAKE_TIMEOUT = 10_000;
 // and bootstrap an owner↔requester channel on demand. The requester is either
 // a worker (a __acquire-ref frame arrived from it) or the main thread itself.
 let nextWorkerId = 1;
-const workersById = new Map<string, Worker>();
-// Reverse lookup for acquire routing: the requester is a Worker; its id is the
-// holder identity for the liveness plane (one channel per owner↔holder pair).
-const workerIdByWorker = new Map<Worker, string>();
+// The worker is always a Transport here: spawn() converts a Worker to a
+// messageport-type Transport before recursing, so every actor's main channel
+// is the unified abstraction.
+const workersById = new Map<string, Transport>();
+// Reverse lookup for acquire routing: the requester is a Worker (its id is the
+// holder identity for the liveness plane) or a Transport; id lookup enables
+// the owner↔requester channel bootstrap on both paths.
+const workerIdByWorker = new Map<Worker | Transport, string>();
 // Established (owner, holder) pairs: the liveness channel is created once per
 // pair, on the first serve; later serves reuse it on both sides.
 const livenessPairs = new Set<string>();
 
-function routeAcquire(refId: string, requester: Worker): void {
+function routeAcquire(refId: string, requester: Transport): void {
   // refId format: "<ownerWorkerId>:<localCount>"
   const ownerId = refId.slice(0, refId.indexOf(":"));
   const owner = workersById.get(ownerId);
@@ -161,7 +167,7 @@ function routeAcquire(refId: string, requester: Worker): void {
     transfer1.push(lc.port1);
     transfer2.push(lc.port2);
   }
-  owner.postMessage(
+  owner.send(
     {
       type: "__serve-ref",
       refId,
@@ -169,9 +175,9 @@ function routeAcquire(refId: string, requester: Worker): void {
       holderId: requesterId,
       livenessPort: livenessPort1,
     } satisfies Frame,
-    { transfer: transfer1 },
+    transfer1,
   );
-  requester.postMessage(
+  requester.send(
     {
       type: "__ref-acquired",
       refId,
@@ -179,7 +185,7 @@ function routeAcquire(refId: string, requester: Worker): void {
       ownerId,
       livenessPort: livenessPort2,
     } satisfies Frame,
-    { transfer: transfer2 },
+    transfer2,
   );
 }
 
@@ -189,11 +195,9 @@ function routeAcquireMain(refId: string): void {
   const owner = workersById.get(ownerId);
   if (!owner) return;
   const { port1, port2 } = new MessageChannel();
-  owner.postMessage(
+  owner.send(
     { type: "__serve-ref", refId, port: port1 } satisfies Frame,
-    {
-      transfer: [port1],
-    },
+    [port1],
   );
   dispatchControlFrame({ type: "__ref-acquired", refId, port: port2 });
 }
@@ -279,9 +283,19 @@ export async function spawn<
   T,
   const C extends readonly Codec<unknown>[] = readonly Codec<unknown>[],
 >(
-  worker: Worker,
+  source: Worker | Transport,
   options: SpawnOptions<C> = {},
 ): Promise<Remote<T, CodecValueTypes<C>> & ActorHandle> {
+  // Worker is the structured-clone message-port world: convert it to a
+  // messageport-type Transport and recurse — every actor thereafter runs on
+  // the unified Transport abstraction (Worker / process IPC / WebSocket / TCP).
+  if (source instanceof Worker) {
+    return spawn<T, C>(
+      fromMessagePort(source as unknown as MessagePort),
+      options,
+    );
+  }
+  const worker = source;
   // Constraint: the worker handshake is not buffered — call spawn() right after
   // `new Worker(...)`. If messages arrive before the onmessage handler below is
   // set (e.g. another await in between), the handshake is lost and spawn()
@@ -303,14 +317,14 @@ export async function spawn<
   // just another adapter, identical to a worker-to-worker link.
   const rpcProxy = createRpcProxy(registry, {
     send: (request, transfer) =>
-      worker.postMessage(
+      worker.send(
         {
           type: "request",
           id: request.id,
           method: request.method,
           args: request.args,
         } satisfies Frame,
-        { transfer },
+        transfer,
       ),
     isDead: () => dead,
   });
@@ -331,8 +345,10 @@ export async function spawn<
     rejectHandshake = reject;
   });
 
-  worker.onmessage = (ev: MessageEvent<Frame>) => {
-    const frame = ev.data;
+  // Transport onMessage delivers { data, ports } wrappers (MessageEvent-like),
+  // carrying any transferred MessagePorts (e.g. reference-acquire handshakes).
+  worker.onMessage((ev) => {
+    const frame = ev.data as Frame;
     if (frame.type === "handshake") {
       if (frame.version !== PROTOCOL_VERSION) {
         kill(
@@ -359,7 +375,7 @@ export async function spawn<
         return;
       }
       // Tell the worker its id (for refIds); FIFO after the handshake.
-      worker.postMessage({ type: "__worker-id", id: workerId } satisfies Frame);
+      worker.send({ type: "__worker-id", id: workerId } satisfies Frame);
       resolveHandshake?.();
       return;
     }
@@ -376,16 +392,21 @@ export async function spawn<
     // Remaining worker→main control frames (e.g. __holder-dead death notices
     // from the liveness sweep) go to registered codec control handlers.
     dispatchControlFrame(frame as ControlFrame);
-  };
+  });
 
-  worker.onerror = (ev) =>
-    kill(
-      new Error(
-        `Worker crashed: ${ev.message}`,
-        { cause: ev.error },
-      ),
-    );
-  worker.onmessageerror = () => kill(new Error("Worker deserialization error"));
+  // Worker-only crash detection: the Transport abstraction has no error event;
+  // framed transports surface death through failAll / closed channels.
+  if (worker instanceof Worker) {
+    worker.onerror = (ev) =>
+      kill(
+        new Error(
+          `Worker crashed: ${ev.message}`,
+          { cause: ev.error },
+        ),
+      );
+    worker.onmessageerror = () =>
+      kill(new Error("Worker deserialization error"));
+  }
 
   function kill(reason: unknown): void {
     if (dead) return;
@@ -395,7 +416,7 @@ export async function spawn<
     // If the handshake hasn't finished yet (version/codec mismatch, worker crash),
     // reject it so spawn() fails instead of hanging.
     rejectHandshake?.(reason);
-    worker.terminate();
+    worker.close();
     // A dead worker can no longer serve references: drop it from acquire routing.
     workersById.delete(workerId);
     workerIdByWorker.delete(worker);
@@ -414,9 +435,9 @@ export async function spawn<
     dead = true;
     registry.failAll();
     try {
-      worker.postMessage({ type: "dispose" } satisfies Frame);
+      worker.send({ type: "dispose" } satisfies Frame);
     } finally {
-      worker.terminate();
+      worker.close();
     }
     rpcProxy.rejectAll(new ActorDiedError());
     return Promise.resolve();

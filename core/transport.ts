@@ -36,8 +36,13 @@ export interface Transport {
   readonly kind: TransportKind;
   /** Send a frame on the main message channel; transferables only on messageport transports. */
   send(frame: unknown, transfer?: Transferable[]): void;
-  /** Register the main-channel inbound handler (a second call replaces the first). */
-  onMessage(handler: (frame: unknown) => void): void;
+  /**
+   * Register the main-channel inbound handler (a second call replaces the
+   * first). The event is MessageEvent-shaped ({ data, ports }) so every
+   * transport — including the Worker path converted via fromMessagePort —
+   * delivers transferred MessagePorts uniformly.
+   */
+  onMessage(handler: (ev: TransportMessage) => void): void;
   /**
    * Open a new logical channel. Returns the local Channel plus the token to
    * hand to the peer: a MessagePort (transferable) on messageport transports,
@@ -56,6 +61,12 @@ export interface TransportOptions {
   onClosed?: () => void;
 }
 
+/** MessageEvent-shaped inbound frame: data plus any transferred MessagePorts. */
+export interface TransportMessage {
+  data: unknown;
+  ports: readonly MessagePort[];
+}
+
 /**
  * messageport-type Transport over a raw MessagePort (the current Worker main
  * channel, a link port, or a transferred acquire port). No framing: values ride
@@ -67,7 +78,7 @@ export function fromMessagePort(
   options: TransportOptions = {},
 ): Transport {
   const channels = new Set<Channel>();
-  let handler: ((frame: unknown) => void) | undefined;
+  let handler: ((ev: TransportMessage) => void) | undefined;
   let channelHandler: ((channel: Channel) => void) | undefined;
   let closed = false;
 
@@ -81,7 +92,7 @@ export function fromMessagePort(
       channelHandler?.(channel);
       return;
     }
-    handler?.(ev.data);
+    handler?.({ data: ev.data, ports: ev.ports });
   };
   port.onmessageerror = () => close();
 
@@ -122,8 +133,8 @@ export function fromMessagePort(
   };
 }
 
-/** Internal marker on framed sub-channels: their Mux channel id. */
-interface MuxChannel extends Channel {
+/** Internal marker on framed sub-channels: their Mux channel id. */ interface MuxChannel
+  extends Channel {
   _ch: number;
   _deliver(value: unknown): void;
 }
@@ -146,7 +157,7 @@ export function framedTransport(
   const channels = new Map<number, MuxChannel>();
   const pending = new Map<number, MuxChannel>();
   let nextCh = 1;
-  let handler: ((frame: unknown) => void) | undefined;
+  let handler: ((ev: TransportMessage) => void) | undefined;
   let channelHandler: ((channel: Channel) => void) | undefined;
   let closed = false;
 
@@ -233,7 +244,7 @@ export function framedTransport(
       return;
     }
     // unknown channel: fall back to the main handler
-    handler?.(frame);
+    handler?.({ data: frame, ports: [] });
   }
 
   // Inbound: byte stream → decoder → Mux dispatch. pipeThrough coordinates

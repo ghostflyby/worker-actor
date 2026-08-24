@@ -6,7 +6,9 @@ import type { Channel } from "./core/channel.ts";
 interface Transport {
   kind: string;
   send(frame: unknown, transfer?: Transferable[]): void;
-  onMessage(h: (frame: unknown) => void): void;
+  onMessage(
+    h: (ev: { data: unknown; ports: readonly MessagePort[] }) => void,
+  ): void;
   openChannel(): { channel: Channel; token: unknown };
   onChannel(h: (channel: Channel) => void): void;
   close(): void;
@@ -85,7 +87,7 @@ function wirePair(): { a: Transport; b: Transport } {
 Deno.test("framedTransport: main-channel messages round-trip over bytes", async () => {
   const { a, b } = wirePair();
   const got: unknown[] = [];
-  b.onMessage((v) => got.push(v));
+  b.onMessage((ev) => got.push(ev.data));
   a.send({ hello: "world" });
   assertEquals(await until(() => got.length === 1), true);
   assertEquals(got, [{ hello: "world" }]);
