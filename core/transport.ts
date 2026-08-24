@@ -31,6 +31,7 @@ import { wrapPort } from "./channel.ts";
 import {
   createDecoder,
   createEncoder,
+  deserialize,
   type MuxFrame,
   serialize,
 } from "./frame.ts";
@@ -406,11 +407,14 @@ export function messageTransport(
   options: {
     send: (message: unknown) => void;
     onClosed?: () => void;
+    /** Transform an inbound message before Mux dispatch (may be async, e.g. Blob → bytes). */
+    decode?: (message: unknown) => unknown | Promise<unknown>;
   },
 ): MessageTransport {
   const mux = createMux(options.send, {
     onClosed: options.onClosed,
   });
+  const decode = options.decode ?? ((m: unknown) => m);
   let closed = false;
   return {
     get kind(): TransportKind {
@@ -432,7 +436,13 @@ export function messageTransport(
       return mux.claimOrphan(ch);
     },
     deliver(message) {
-      mux.deliver(message);
+      if (closed) return;
+      const decoded = decode(message);
+      if (decoded instanceof Promise) {
+        void decoded.then((v) => mux.deliver(v), () => {});
+      } else {
+        mux.deliver(decoded);
+      }
     },
     close() {
       if (closed) return;
@@ -481,6 +491,20 @@ export function fromWebSocket(
     send: (message) => {
       // v8-serialize the value into a binary message (the WS message is the frame).
       socket.send(serialize(message));
+    },
+    // Inbound WS messages are binary (v8 bytes) or text. Deno delivers binary
+    // as Blob by default; convert to bytes then deserialize.
+    decode: async (message) => {
+      if (typeof message === "string") return message;
+      let bytes: Uint8Array;
+      if (message instanceof Blob) {
+        bytes = new Uint8Array(await message.arrayBuffer());
+      } else if (message instanceof ArrayBuffer) {
+        bytes = new Uint8Array(message);
+      } else {
+        bytes = message as Uint8Array;
+      }
+      return deserialize(bytes);
     },
     onClosed: options.onClosed,
   });
