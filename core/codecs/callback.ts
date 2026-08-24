@@ -168,6 +168,9 @@ function encode(fn: AnyFunction, ctx: EncodeContext): unknown {
       channel.close();
     }
   });
+  if (!peerPort) {
+    throw new Error("callback codec requires a messageport transport");
+  }
   return {
     [CODEC_PLACEHOLDER_KEY]: "callback",
     port: peerPort,

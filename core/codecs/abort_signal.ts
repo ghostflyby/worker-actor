@@ -103,6 +103,9 @@ function encode(signal: AbortSignal, ctx: EncodeContext): unknown {
     signal.addEventListener("abort", onAbort, { once: true });
   }
   state.senders.add(cleanup);
+  if (!peerPort) {
+    throw new Error("abort-signal codec requires a messageport transport");
+  }
   return {
     [CODEC_PLACEHOLDER_KEY]: "abort-signal",
     port: peerPort,

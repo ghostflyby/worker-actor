@@ -108,6 +108,9 @@ function encode(value: AsyncIterable<unknown>, ctx: EncodeContext): unknown {
     state.producerStops.delete(stopFn);
   });
   state.producerStops.add(stopFn);
+  if (!peerPort) {
+    throw new Error("iterable codec requires a messageport transport");
+  }
   return {
     [CODEC_PLACEHOLDER_KEY]: "iterable",
     port: peerPort,

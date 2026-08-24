@@ -33,6 +33,15 @@ export interface Channel {
   readonly closed: boolean;
   /** The underlying MessagePort; transferring it to a peer moves the channel (reference hand-off). */
   readonly port: MessagePort;
+  /**
+   * How this channel crosses the boundary: "messageport" (the peer end is a
+   * MessagePort, transferable with the placeholder) or "framed" (the peer end
+   * is established by a Mux token over the parent transport). Codecs that can
+   * work either way (e.g. iterable) use this to choose their frame format;
+   * codecs that fundamentally require a MessagePort (e.g. remote-ref's
+   * liveness planes) only run on "messageport".
+   */
+  readonly kind?: "messageport" | "framed";
   /** Send a frame to the peer; transferable ports/buffers go in the second argument. */
   send(message: unknown, transfer?: Transferable[]): void;
   /** Register the inbound frame handler (a second call replaces the first). */
@@ -41,14 +50,37 @@ export interface Channel {
   close(): void;
 }
 
-/** The peer port is transferred with the placeholder; the local end is wrapped as a Channel. */
+/**
+ * The result of openChannel(): the local Channel plus how the peer end is
+ * handed over. On a messageport context this is a transferable MessagePort
+ * (`peerPort`); on a framed context `peerPort` is undefined and `token` is a
+ * Mux value the peer uses to rebuild the channel. Existing codecs read
+ * `peerPort` (messageport-only); transport-aware codecs branch on it.
+ */
+export interface ChannelPeer {
+  channel: Channel;
+  /** Transferable peer port (messageport transports); undefined on framed. */
+  peerPort?: MessagePort;
+  /** Mux token (framed transports); undefined on messageport. */
+  token?: unknown;
+}
+
+/**
+ * Open a new logical channel for a value crossing the boundary. On a
+ * messageport context this creates a MessageChannel and transfers port2 with
+ * the placeholder (current behavior). On a framed context it delegates to the
+ * transport's openChannel() and returns the Mux token instead — the peer
+ * rebuilds the channel from the token via onChannel.
+ */
 export function openChannel(
   ctx: EncodeContext,
   options?: ChannelOptions,
-): {
-  channel: Channel;
-  peerPort: MessagePort;
-} {
+): ChannelPeer {
+  const transport = ctx.transport;
+  if (transport.kind === "framed") {
+    const opened = transport.openChannel();
+    return { channel: opened.channel, token: opened.token };
+  }
   const { port1, port2 } = new MessageChannel();
   ctx.transfer.push(port2);
   return { channel: wrapPort(port1, options), peerPort: port2 };
@@ -62,7 +94,11 @@ export function connectChannel(
   return wrapPort(port, options);
 }
 
-function wrapPort(port: MessagePort, options: ChannelOptions = {}): Channel {
+/** Wrap a local/transferred MessagePort as a Channel (exported for transport adapters). */
+export function wrapPort(
+  port: MessagePort,
+  options: ChannelOptions = {},
+): Channel {
   let closed = false;
   let handler: ((message: unknown) => void) | undefined;
 
