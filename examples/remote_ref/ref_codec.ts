@@ -47,6 +47,7 @@ import {
   type Codec,
   CODEC_PLACEHOLDER_KEY,
   connectChannel,
+  connectToken,
   type ControlFrame,
   type DecodeContext,
   type EncodeContext,
@@ -310,8 +311,10 @@ interface RefToken {
 interface RefHandle {
   [CODEC_PLACEHOLDER_KEY]: "remote-ref";
   refId: string;
-  /** Present on a fresh owner-produced reference; absent on a refId-only hand-off. */
+  /** Present on a fresh owner-produced reference on a messageport transport. */
   port?: MessagePort;
+  /** Present on a fresh owner-produced reference on a Mux transport (channel-establishment token). */
+  token?: unknown;
 }
 
 type RefFrame =
@@ -686,8 +689,49 @@ function materialize(
   }
 }
 
-/** __ref-acquired: the acquire-completion port arrived — materialize and flush. */
-function onRefAcquiredInner(
+/** Materialize a pending entry from a Mux token (instead of a port). */
+function materializeToken(
+  entry: PendingEntry,
+  transport: DecodeContext["transport"],
+  token: { __mux: "open"; ch: number },
+): void {
+  if (entry.real) {
+    closeTokenChannel(transport, token);
+    return;
+  }
+  const channel = connectToken(transport, token);
+  entry.registry.registerChannel(channel);
+  const real = createRefProxy(channel, entry.registry, entry.refId, () => {
+    // see materialize(): the real proxy's death does not end the entity
+  });
+  entry.real = real;
+  pendingByRefId.delete(entry.refId);
+  identityByRefId.set(entry.refId, new WeakRef(entry.proxy));
+  const calls = entry.calls;
+  entry.calls = [];
+  for (const c of calls) {
+    const p =
+      (real as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>)
+        [
+          c.method
+        ](...c.args);
+    p.then(c.resolve, c.reject);
+  }
+}
+
+/** Close the channel established by a Mux token (best-effort; the transport owns it). */
+function closeTokenChannel(
+  transport: DecodeContext["transport"],
+  token: unknown,
+): void {
+  if (typeof token !== "object" || token === null) return;
+  const t = token as { __mux?: unknown; ch?: unknown };
+  if (t.__mux !== "open" || typeof t.ch !== "number") return;
+  const orphan = transport.claimOrphan?.(t.ch);
+  if (orphan) orphan.close();
+}
+
+/** __ref-acquired: the acquire-completion port arrived — materialize and flush. */ function onRefAcquiredInner(
   frame: {
     refId: string;
     port: MessagePort;
@@ -831,24 +875,22 @@ export const remoteRefCodec: Codec<RemoteRef<unknown>> = {
       // closure captures only the refId, not the object.
       const obj = (ref as unknown as RefToken).obj as object;
       const refId = refIdFor(obj);
-      const { channel, peerPort } = openChannel(ctx, {
+      const { channel, peerPort, token } = openChannel(ctx, {
         onClosed: () => {
           untrackOwnerChannel(refId, channel);
           ctx.registry.unregisterChannel(channel);
         },
       });
-      if (!peerPort) {
-        throw new Error("remote-ref requires a messageport transport");
-      }
       ctx.registry.registerChannel(channel);
       startRefOwner(channel, refId, ctx.registry);
       // Fresh tokens travel to the main thread only (no holder worker id).
       trackOwnerChannel(refId, channel, undefined);
-      return {
+      const handle: RefHandle = {
         [CODEC_PLACEHOLDER_KEY]: "remote-ref",
         refId,
-        port: peerPort,
-      } satisfies RefHandle;
+        ...(peerPort !== undefined ? { port: peerPort } : { token }),
+      };
+      return handle;
     }
     // Sharing semantics: a proxy encodes as its refId token only. The holder's
     // proxy stays alive; the receiver acquires a fresh per-holder channel via
@@ -861,17 +903,18 @@ export const remoteRefCodec: Codec<RemoteRef<unknown>> = {
     } satisfies RefHandle;
   },
   decode(placeholder: RefHandle, ctx: DecodeContext): RemoteRef<unknown> {
-    const { refId, port } = placeholder;
+    const { refId, port, token } = placeholder;
     // Back to the owner? Restore a local call-through reference (collapse):
     // the reference completed its journey home; close any channels still open
-    // for it and call the real object directly. Works for both fresh (port
-    // present) and refId-only hand-off arrivals.
+    // for it and call the real object directly. Works for both fresh (port /
+    // token present) and refId-only hand-off arrivals.
     const obj = objByRefId.get(refId)?.deref();
     if (obj !== undefined) {
       // Restore: the reference came home. Under sharing semantics other
-      // holders keep their own channels, so only the arriving port (if any)
+      // holders keep their own channels, so only the arriving channel (if any)
       // is closed — never the whole per-holder set.
-      port?.close();
+      if (port !== undefined) port.close();
+      if (token !== undefined) closeTokenChannel(ctx.transport, token);
       return createLocalRef(obj);
     }
     // Identity is path- and registry-independent: every arrival for a refId
@@ -880,17 +923,25 @@ export const remoteRefCodec: Codec<RemoteRef<unknown>> = {
     // `===` therefore holds across all arrival paths.
     const existing = identityByRefId.get(refId)?.deref();
     if (existing) {
-      port?.close(); // entity exists (pending or direct): extra port is redundant
+      if (port !== undefined) port.close();
+      if (token !== undefined) closeTokenChannel(ctx.transport, token);
       return existing;
     }
     const entry = pendingByRefId.get(refId);
     if (entry) {
       // Already known as a pending (refId-only) arrival: attach this direct
-      // port if one arrived — the pending proxy becomes the single entity.
+      // channel if one arrived — the pending proxy becomes the single entity.
       if (port !== undefined) materialize(entry, port);
+      else if (token !== undefined) {
+        materializeToken(
+          entry,
+          ctx.transport,
+          token as { __mux: "open"; ch: number },
+        );
+      }
       return entry.proxy;
     }
-    if (port === undefined) {
+    if (port === undefined && token === undefined) {
       // A refId-only hand-off arrived at a non-owner. The identity travels;
       // the channel is a per-holder connection that must be established via
       // the main thread (the only peer that can route between workers). Return
@@ -899,7 +950,9 @@ export const remoteRefCodec: Codec<RemoteRef<unknown>> = {
     }
     // First direct arrival: create the entity and register it in the identity
     // table (subsequent arrivals of any path return the same object).
-    const channel = connectChannel(port);
+    const channel = port !== undefined
+      ? connectChannel(port)
+      : connectToken(ctx.transport, token as { __mux: "open"; ch: number });
     ctx.registry.registerChannel(channel);
     const proxy = createRefProxy(channel, ctx.registry, refId, () => {
       identityByRefId.delete(refId);

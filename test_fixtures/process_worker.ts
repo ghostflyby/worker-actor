@@ -1,5 +1,16 @@
 // Process-actor fixture: the child module served via serveProcess.
 import { serveProcess } from "../worker_runtime.ts";
+import { remoteRef, remoteRefCodec } from "./remote_ref_helper.ts";
+
+const counterObj = {
+  value: 0,
+  inc(): number {
+    return ++this.value;
+  },
+  get(): number {
+    return this.value;
+  },
+};
 
 export const rpc = {
   add(a: number, b: number): number {
@@ -29,6 +40,10 @@ export const rpc = {
   async apply(cb: (x: number) => Promise<number>, x: number): Promise<number> {
     return await cb(x);
   },
+  /** Hand out a remote reference to an object owned by this process. */
+  getCounter(): ReturnType<typeof remoteRef> {
+    return remoteRef(counterObj);
+  },
 };
 
-serveProcess(rpc);
+serveProcess(rpc, { codecs: [remoteRefCodec] });
