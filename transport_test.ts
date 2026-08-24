@@ -49,8 +49,8 @@ function wirePair(): { a: Transport; b: Transport } {
     readable: ReadableStream<Uint8Array>;
     writable: WritableStream<Uint8Array>;
   } {
-    let queue: Uint8Array[] = [];
-    let waiters: Array<(chunk: Uint8Array) => void> = [];
+    const queue: Uint8Array[] = [];
+    const waiters: Array<(chunk: Uint8Array) => void> = [];
     return {
       readable: new ReadableStream<Uint8Array>({
         pull(controller) {

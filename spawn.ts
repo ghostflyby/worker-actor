@@ -29,7 +29,6 @@ import { errorCodec } from "./core/codecs/error.ts";
 import { abortSignalCodec } from "./core/codecs/abort_signal.ts";
 import { callbackCodec } from "./core/codecs/callback.ts";
 import { fromMessagePort, type Transport } from "./core/transport.ts";
-import { triggerAcquire } from "./core/worker-context.ts";
 
 // The RPC boundary is inherently dynamic: type safety comes from Remote<T>
 // deriving the worker's concrete signatures, and this any only serves shape

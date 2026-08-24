@@ -104,7 +104,7 @@ export function createDecoder(options: FrameOptions = {}): TransformStream<
 > {
   const max = options.maxFrame ?? DEFAULT_MAX_FRAME;
   let stage: "header" | "payload" = "header";
-  let headerBuf = new Uint8Array(HEADER);
+  const headerBuf = new Uint8Array(HEADER);
   let headerFilled = 0;
   let payload: Uint8Array | undefined; // accumulating current frame's payload
   let payloadFilled = 0;

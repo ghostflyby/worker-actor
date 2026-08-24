@@ -161,7 +161,7 @@ export function framedTransport(
   let channelHandler: ((channel: Channel) => void) | undefined;
   let closed = false;
 
-  function fail(reason: unknown): void {
+  function fail(): void {
     if (closed) return;
     closed = true;
     for (const ch of channels.values()) ch.close();
@@ -260,8 +260,8 @@ export function framedTransport(
         if (done) break;
         handleMux(value as MuxFrame);
       }
-    } catch (e) {
-      fail(e);
+    } catch {
+      fail();
     }
   };
   void pumpIn();
@@ -277,8 +277,8 @@ export function framedTransport(
         await writer.write(value);
       }
       await writer.close();
-    } catch (e) {
-      fail(e);
+    } catch {
+      fail();
     }
   };
   void pumpOut();

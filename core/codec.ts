@@ -348,8 +348,8 @@ export class PayloadCodecRegistry {
 let defaultTransport: Transport | undefined;
 function defaultMessagePortTransport(): Transport {
   if (!defaultTransport) {
-    const { port1, port2 } = new MessageChannel();
-    // Keep port2 referenced so the port pair stays open; port1 is our end.
+    const { port2 } = new MessageChannel();
+    // Keep port2 referenced so the port pair stays open.
     void port2;
     defaultTransport = {
       kind: "messageport",

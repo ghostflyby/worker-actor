@@ -837,7 +837,9 @@ export const remoteRefCodec: Codec<RemoteRef<unknown>> = {
           ctx.registry.unregisterChannel(channel);
         },
       });
-      if (!peerPort) throw new Error("remote-ref requires a messageport transport");
+      if (!peerPort) {
+        throw new Error("remote-ref requires a messageport transport");
+      }
       ctx.registry.registerChannel(channel);
       startRefOwner(channel, refId, ctx.registry);
       // Fresh tokens travel to the main thread only (no holder worker id).
