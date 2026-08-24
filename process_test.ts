@@ -59,3 +59,33 @@ Deno.test("spawnProcess: AsyncIterable streams across processes (Mux token)", as
     await actor.dispose();
   }
 });
+
+Deno.test("spawnProcess: AbortSignal crosses processes and cancels work", async () => {
+  const actor = await spawnProcess<typeof ProcessWorker.rpc>(
+    "./test_fixtures/process_worker.ts",
+  );
+  try {
+    const controller = new AbortController();
+    const running = actor.spin(5000, controller.signal);
+    await new Promise((r) => setTimeout(r, 50));
+    controller.abort();
+    const iterations = await running;
+    assertEquals(typeof iterations, "number");
+    // The child saw the abort and stopped well before the 5s budget.
+    assertEquals(iterations < 5000, true);
+  } finally {
+    await actor.dispose();
+  }
+});
+
+Deno.test("spawnProcess: callbacks cross processes and return results", async () => {
+  const actor = await spawnProcess<typeof ProcessWorker.rpc>(
+    "./test_fixtures/process_worker.ts",
+  );
+  try {
+    const result = await actor.apply(async (x: number) => x * 2, 21);
+    assertEquals(result, 42);
+  } finally {
+    await actor.dispose();
+  }
+});
