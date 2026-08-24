@@ -52,6 +52,9 @@ export type {
   TransportMessage,
 } from "./core/transport.ts";
 
+export { createActorRegistry } from "./core/registry.ts";
+export type { ActorRegistry } from "./core/registry.ts";
+
 export { createRpcProxy, makeRpcHandler } from "./core/rpc.ts";
 export type {
   PeerRpc,

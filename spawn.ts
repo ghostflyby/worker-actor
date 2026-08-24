@@ -126,29 +126,23 @@ export interface SpawnOptions<
 
 const HANDSHAKE_TIMEOUT = 10_000;
 
-// Reference-acquire routing: each spawned worker gets a stable id (embedded in
-// refIds as a prefix), so the main thread can resolve "refId → owner worker"
-// and bootstrap an owner↔requester channel on demand. The requester is either
-// a worker (a __acquire-ref frame arrived from it) or the main thread itself.
-let nextWorkerId = 1;
-// The worker is always a Transport here: spawn() converts a Worker to a
-// messageport-type Transport before recursing, so every actor's main channel
-// is the unified abstraction.
-const workersById = new Map<string, Transport>();
-// Reverse lookup for acquire routing: the requester is a Worker (its id is the
-// holder identity for the liveness plane) or a Transport; id lookup enables
-// the owner↔requester channel bootstrap on both paths.
-const workerIdByWorker = new Map<Worker | Transport, string>();
+// Reference-acquire routing: each spawned actor gets a stable transport id
+// (embedded in refIds as a prefix), so the coordinator can resolve
+// "refId → owner transport" and bootstrap an owner↔requester channel on
+// demand. This is the pluggable ActorRegistry — the minimal discovery layer.
+import { createActorRegistry } from "./core/registry.ts";
+
+const actorRegistry = createActorRegistry();
 // Established (owner, holder) pairs: the liveness channel is created once per
 // pair, on the first serve; later serves reuse it on both sides.
 const livenessPairs = new Set<string>();
 
 function routeAcquire(refId: string, requester: Transport): void {
-  // refId format: "<ownerWorkerId>:<localCount>"
+  // refId format: "<ownerId>:<localCount>"
   const ownerId = refId.slice(0, refId.indexOf(":"));
-  const owner = workersById.get(ownerId);
+  const owner = actorRegistry.resolve(ownerId);
   if (!owner) return; // unknown or dead owner: nothing to bootstrap
-  const requesterId = workerIdByWorker.get(requester);
+  const requesterId = actorRegistry.idOf(requester);
   const { port1, port2 } = new MessageChannel();
   const transfer1: Transferable[] = [port1];
   const transfer2: Transferable[] = [port2];
@@ -192,7 +186,7 @@ function routeAcquire(refId: string, requester: Transport): void {
 /** Main-side acquire: the main thread itself is the requester (materialize locally). */
 function routeAcquireMain(refId: string): void {
   const ownerId = refId.slice(0, refId.indexOf(":"));
-  const owner = workersById.get(ownerId);
+  const owner = actorRegistry.resolve(ownerId);
   if (!owner) return;
   const { port1, port2 } = new MessageChannel();
   owner.send(
@@ -342,13 +336,11 @@ async function spawnOnTransport<
     isDead: () => dead,
     transport: worker,
   });
-  // Assign a stable worker id (embedded in refIds) and register it for acquire
-  // routing. The id is sent after the handshake so the worker is definitely
-  // ready; FIFO ordering on the channel guarantees it arrives before any
-  // user request.
-  const workerId = `w${nextWorkerId++}`;
-  workersById.set(workerId, worker);
-  workerIdByWorker.set(worker, workerId);
+  // Assign a stable transport id (embedded in refIds) and register it for
+  // acquire routing. The id is sent after the handshake so the worker is
+  // definitely ready; FIFO ordering on the channel guarantees it arrives
+  // before any user request.
+  const workerId = actorRegistry.register(worker);
   let dead = false;
   let resolveHandshake: (() => void) | undefined;
   let rejectHandshake: ((reason: unknown) => void) | undefined;
@@ -435,8 +427,7 @@ async function spawnOnTransport<
     if (rawWorker) rawWorker.terminate();
     else worker.close();
     // A dead worker can no longer serve references: drop it from acquire routing.
-    workersById.delete(workerId);
-    workerIdByWorker.delete(worker);
+    actorRegistry.unregister(workerId);
     // Notify the owner (e.g. an actor pool) so it can remove/replace the member.
     // Deliberately NOT fired by dispose(): a deliberate shutdown is not a death.
     options.onDeath?.(reason);
