@@ -224,62 +224,66 @@ export function createDecoder(): TransformStream<Uint8Array, unknown>; // 解帧
 
 见第 2 节。结论已用 2026-08 实测验证，后续实现以此为事实依据。
 
-### Phase 1 — Transport + 帧层（TransformStream）+ 适配器（纯新增，零行为变化）
+### Phase 1 — Transport + 帧层（TransformStream）+ 适配器 ✅ 已完成
 
 - `core/transport.ts`：`Transport` 接口（`openChannel` / `onChannel`）； 适配器
-  `fromMessagePort` / `fromNodeIpc` / `fromWebSocket` / `fromTcp`。字节流输入
-  统一为 WHATWG `ReadableStream`/`WritableStream<Uint8Array>`， **不提供 Node
-  `stream.Duplex` 桥接**。
+  `fromMessagePort` / `fromNodeIpc` / `fromWebSocket`。字节流输入统一为 WHATWG
+  `ReadableStream`/`WritableStream<Uint8Array>`， **不提供 Node `stream.Duplex`
+  桥接**。
 - `core/frame.ts`：`createEncoder` / `createDecoder`（TransformStream， 对象流 ⇄
   字节流）；Mux（按 channelId 分派子通道）。
 - `core/channel.ts`：`Channel.kind` 标注；`port` 可选；`openChannel(ctx)` 改为
-  `ctx.transport.openChannel()`。
-- 验证：现有 85 测试全绿；新增帧层单测（分段输入、坏帧、空载荷、大载荷、
-  多路复用交错）。
+  `ctx.transport.openChannel()`；`connectToken`（Mux 通道令牌关联）。
+- 验证：帧层单测（分段输入、坏帧、空载荷、大载荷、多路复用交错）+ transport
+  单测（messageport / framed / message 三形态）。
 
-### Phase 2 — 进程 actor（多进程）
+### Phase 2 — 进程 actor（多进程）✅ 已完成（口径有更新）
 
-- `spawn.ts`：`spawn` 泛化为接收 `ActorTransport`
-  （`send / onMessage / onError / kill / canTransfer`）； 保留 `spawn(worker)`
-  签名（`spawnWorker` 薄封装）； 新增 `spawnProcess(command)`（内部
-  `fromDenoStdio` 或 `fromNodeIpc`）。
-- `worker_runtime.ts`：`serveWorker` 泛化为接收 `RuntimeTransport` （代替
-  `self.postMessage`）；新增进程端入口 （node
-  子进程：`process.on('message')`；Deno 子进程：stdin/stdout 流）。
-- `core/worker-context.ts`：`triggerAcquire` 的"self.postMessage vs mainAcquire"
-  侧判定改为"当前传输的 send"。
-- `pool.ts`：`spawnWorker` 工厂返回类型放宽（Worker | TransportHandle）， 或新增
-  `createProcessPool`。
-- 验证：进程版 calculator 示例；进程版 ref / iterable / callback 测试； 一端
-  Worker 一端进程的混合拓扑。
+- `spawn.ts`：`spawn` 泛化为接收 `Worker | Transport`（Worker 经
+  `fromMessagePort` 转 Transport 后递归）；新增 `spawnProcess`（fork IPC + Deno
+  权限控制）和 `spawnNode`（多 actor 节点）作为便捷封装。**`spawn*` 系列
+  不是独立入口，`spawn(Transport)` 是统一入口**。
+- `worker_runtime.ts`：`createRuntime` 共享（`serveWorker` / `serveProcess` /
+  `serveNode` 多 actor）。
+- **进程通道用 `node:child_process` fork IPC（`fromNodeIpc`）**，不是
+  stdin/stdout——fork IPC 是带外通道，子进程 stdout 日志不污染协议。
+- `pool.ts`：`spawnWorker` 工厂仍 Worker-only（进程 pool 未做）。
+- 验证：进程版 RPC / AsyncIterable / AbortSignal / callback 端到端；多 actor
+  节点端到端；混合拓扑未做。
 
-### Phase 3 — 分布式（WebSocket / TCP）
+### Phase 3 — 分布式（WebSocket）部分完成
 
-- `fromWebSocket` / `fromTcp` 落地；引导层（地址注册/发现： 谁在哪、如何回连）。
-- acquire / ref / iterable 跨连接（第 6 节的令牌化在 Phase 2 已就绪）。
-- 验证：本机 TCP 双进程端到端；后续多机。
+- `fromWebSocket`（消息型 Transport，Blob→v8 反序列化）✅ 本地回环端到端。
+- **TCP 适配器明确不做**（WebSocket 取代；TCP 仅作为底层可选，用户侧自行桥接）。
+- 引导层（地址注册/发现：谁在哪、如何回连）❌ 未做。
+- acquire / ref / iterable 跨连接（令牌化已就绪）：iterable / abort-signal /
+  callback 已跨进程；**remote-ref 仍 messageport-only** ❌。
+- 验证：本机 WS 端到端 ✅；多机 ❌。
 
-### Phase 4 — 握手与协议版本
+### Phase 4 — 握手与协议版本 ❌ 未做
 
 - 握手帧增加传输能力字段（`kind` / `canTransfer` / 帧类型），`PROTOCOL_VERSION`
   bump，避免新旧混跑时把"无 transfer 的通道"当成有 transfer 的用。
 
 ## 8. 需要改动的文件清单
 
-| 文件                                   | 改动                                                           | 阶段  |
-| -------------------------------------- | -------------------------------------------------------------- | ----- |
-| `core/transport.ts`（新）              | `Transport` 接口（`openChannel`/`onChannel`）+ 适配器          | P1    |
-| `core/frame.ts`（新）                  | `createEncoder`/`createDecoder`（TransformStream）+ Mux        | P1    |
-| `core/channel.ts`                      | `Channel.kind` 标注；`port` 可选；`openChannel` 改走 transport | P1    |
-| `core/codec.ts`                        | `EncodeContext` 暴露 `transport`；token 语义文档化             | P1    |
-| `spawn.ts`                             | `spawn` 泛化 + `spawnProcess` + `workersById` 键类型放宽       | P2    |
-| `worker_runtime.ts`                    | `serveWorker` 泛化 + 进程端入口                                | P2    |
-| `core/worker-context.ts`               | `triggerAcquire` 传输侧判定                                    | P2    |
-| `pool.ts`                              | 工厂类型放宽 / `createProcessPool`                             | P2    |
-| `core/stream.ts` + ref/callback codecs | 通道令牌化（per-value 通道改为令牌 + 按需建立）                | P2/P3 |
-| `core/protocol.ts`                     | 握手传输能力字段；版本 bump                                    | P4    |
-| `mod.ts` / `deno.json` exports         | 新入口导出                                                     | P2/P3 |
-| `DESIGN.md`                            | 传输章节重写为本文第 3–6 节口径                                | 同步  |
+| 文件                                              | 改动                                                                           | 阶段     |
+| ------------------------------------------------- | ------------------------------------------------------------------------------ | -------- |
+| `core/transport.ts`（新）                         | `Transport` 接口（`openChannel`/`onChannel`）+ 适配器                          | ✅ P1    |
+| `core/frame.ts`（新）                             | `createEncoder`/`createDecoder`（TransformStream）+ Mux                        | ✅ P1    |
+| `core/channel.ts`                                 | `Channel.kind` 标注；`port` 可选；`openChannel` 改走 transport；`connectToken` | ✅ P1    |
+| `core/codec.ts`                                   | `EncodeContext`/`DecodeContext` 暴露 `transport`；token 语义                   | ✅ P1    |
+| `spawn.ts`                                        | `spawn` 泛化（Worker \| Transport）+ `spawnProcess` + `spawnNode`              | ✅ P2    |
+| `worker_runtime.ts`                               | `createRuntime` 共享 + `serveProcess` + `serveNode`                            | ✅ P2    |
+| `core/stream.ts` + iterable/abort/callback codecs | 通道令牌化（per-value 通道改为令牌 + 按需建立）                                | ✅ P2/P3 |
+| `mod.ts` / `codec.ts`                             | 公共导出（spawn 泛化 + Transport 适配器 + serveNode 等）                       | ✅ P3    |
+| `examples/remote_ref/ref_codec.ts`                | remote-ref 令牌化（跨进程）                                                    | ❌ 待做  |
+| `core/worker-context.ts`                          | `triggerAcquire` 传输侧判定                                                    | ❌ 待做  |
+| `pool.ts`                                         | 工厂类型放宽 / `createProcessPool`                                             | ❌ 待做  |
+| 引导层（新）                                      | 地址注册/发现（谁在哪、如何回连）                                              | ❌ 待做  |
+| `core/protocol.ts`                                | 握手传输能力字段；版本 bump                                                    | ❌ 待做  |
+| 示例                                              | 进程版 calculator / 混合拓扑                                                   | ❌ 待做  |
+| `DESIGN.md`                                       | 传输章节重写为本文第 3–6 节口径                                                | ❌ 待做  |
 
 ## 9. 兼容性与风险
 
