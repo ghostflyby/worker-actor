@@ -31,7 +31,9 @@ jobs:
         run: deno fmt --check .
 
       - name: Run tests
-        run: deno test --allow-read
+        # --allow-run/--allow-env: process-actor tests (spawnProcess) launch a
+        # child deno process via node:child_process fork IPC.
+        run: deno test --allow-read --allow-run --allow-env
 
       - name: Run tests with GC forced (FinalizationRegistry paths)
-        run: deno test --allow-read --v8-flags=--expose-gc
+        run: deno test --allow-read --allow-run --allow-env --v8-flags=--expose-gc

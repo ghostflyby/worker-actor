@@ -31,7 +31,6 @@ import { wrapPort } from "./channel.ts";
 import {
   createDecoder,
   createEncoder,
-  deserialize,
   type MuxFrame,
   serialize,
 } from "./frame.ts";
