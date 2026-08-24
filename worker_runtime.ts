@@ -28,7 +28,7 @@
 
 import { type Frame, PROTOCOL_VERSION } from "./core/protocol.ts";
 import { type Codec, PayloadCodecRegistry } from "./core/codec.ts";
-import { type Channel, connectChannel } from "./core/channel.ts";
+import { type Channel, connectChannel, connectToken } from "./core/channel.ts";
 import {
   fromMessagePort,
   fromNodeIpc,
@@ -355,4 +355,125 @@ export function serveProcess(
     transport,
     () => transport.close(),
   );
+}
+
+/**
+ * Multi-actor node runtime (model B): one process/connection serves several
+ * named actors. The main channel only performs the handshake (announcing the
+ * actor names) and opens actor channels; each actor's RPC runs on its own
+ * logical channel (a Mux sub-channel on framed/message transports, or a
+ * MessagePort on messageport transports). Actor = channel.
+ *
+ * Usage in the node module (called once at top level):
+ *   import { serveNode } from "./worker_runtime.ts";
+ *   export const actors = { counter: { inc(n) { ... } }, logger: { ... } };
+ *   serveNode(actors);
+ *
+ * The peer (spawnNodeProcess / connectNode) opens one channel per actor and
+ * gets a { [name]: Remote } surface.
+ */
+export function serveNode(
+  rpcs: Record<string, WorkerApi>,
+  options: Omit<ServeWorkerOptions, "onLink"> = {},
+): void {
+  // Build a registry with the same codec setup as the single-actor runtimes.
+  const registry = new PayloadCodecRegistry();
+  for (const codec of options.codecs ?? []) registry.register(codec);
+  for (
+    const codec of [
+      iterableCodec,
+      errorCodec,
+      abortSignalCodec,
+      callbackCodec,
+    ]
+  ) {
+    if (!registry.has(codec.tag)) registry.register(codec);
+  }
+  setActiveRegistry(registry);
+
+  // Resolve the transport from the environment: node:child_process fork IPC if
+  // present, else self (Web Worker).
+  const proc = (globalThis as { process?: unknown }).process as {
+    send(message: unknown): void;
+    on(event: "message", handler: (message: unknown) => void): void;
+  } | undefined;
+  const transport: Transport = proc && typeof proc.send === "function"
+    ? (() => {
+      const t = fromNodeIpc((message) => {
+        proc.send(message);
+        return true;
+      });
+      proc.on("message", (message) => t.deliver(message));
+      return t;
+    })()
+    : fromMessagePort(self as unknown as MessagePort);
+
+  const names = Object.keys(rpcs);
+  const actorChannels = new Set<Channel>();
+
+  const serveChannel = (name: string, channel: Channel): void => {
+    if (!rpcs[name]) {
+      channel.close();
+      return;
+    }
+    registry.registerChannel(channel);
+    actorChannels.add(channel);
+    const handler = makeRpcHandler(rpcs[name], registry, transport);
+    channel.onMessage((message) => {
+      const frame = message as Frame;
+      if (frame.type === "request") {
+        void handler(frame).then((res) => {
+          if (res.ok) {
+            channel.send(
+              { type: "response", id: res.id, ok: true, value: res.value },
+              res.transfer,
+            );
+          } else {
+            channel.send(
+              { type: "response", id: res.id, ok: false, error: res.error },
+            );
+          }
+        });
+      } else if (frame.type === "dispose") {
+        channel.close();
+        actorChannels.delete(channel);
+      }
+    });
+  };
+
+  transport.onMessage((ev) => {
+    const frame = ev.data as { type: string };
+    if (frame.type === "handshake") {
+      // Peer-initiated? No — the node announces itself. Handled below.
+      return;
+    }
+    if (frame.type === "__open-actor") {
+      const f = frame as unknown as {
+        type: "__open-actor";
+        name: string;
+        port?: MessagePort;
+        token?: unknown;
+      };
+      const channel = f.port !== undefined
+        ? connectChannel(f.port)
+        : connectToken(transport, f.token as { __mux: "open"; ch: number });
+      serveChannel(f.name, channel);
+      return;
+    }
+    if (frame.type === "dispose") {
+      registry.failAll();
+      for (const ch of actorChannels) ch.close();
+      actorChannels.clear();
+      transport.close();
+    }
+  });
+
+  // Announce ready + the actor names (handshake). The peer opens actor
+  // channels after this.
+  transport.send({
+    type: "handshake",
+    version: PROTOCOL_VERSION,
+    codecs: registry.tags,
+    actors: names,
+  } as never);
 }

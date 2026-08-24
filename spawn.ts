@@ -625,3 +625,158 @@ function permissionArgs(permissions?: Deno.PermissionOptionsObject): string[] {
   }
   return out;
 }
+
+export interface SpawnNodeOptions {
+  /** Creation interruption (same semantics as SpawnOptions.signal). */
+  signal?: AbortSignal | null;
+  /** Fired when the node process dies (crash / handshake failure; not dispose). */
+  onDeath?: (reason: unknown) => void;
+  /** Deno permissions granted to the child node process. */
+  permissions?: Deno.PermissionOptionsObject;
+  /** Extra CLI args for the child `deno run` invocation. */
+  denoArgs?: string[];
+}
+
+/**
+ * Spawn a multi-actor node process (model B): the child module calls
+ * serveNode(actors) and announces its actor names; this returns a
+ * { [name]: Remote } surface where each actor runs on its own logical
+ * channel over the fork IPC connection.
+ *
+ *   // node.ts
+ *   import { serveNode } from ".../worker_runtime.ts";
+ *   export const actors = { counter: { inc(n) { return n + 1; } } };
+ *   serveNode(actors);
+ *
+ *   // main.ts
+ *   import type * as NodeModule from "./node.ts";
+ *   const node = await spawnNode<typeof NodeModule.actors>("./node.ts");
+ *   await node.counter.inc(1);
+ *   await node.dispose();
+ */
+export async function spawnNode<
+  T extends Record<string, object>,
+>(
+  entrypoint: string,
+  options: SpawnNodeOptions = {},
+): Promise<{ [K in keyof T]: Remote<T[K]> } & { dispose(): Promise<void> }> {
+  const { spawn: cpSpawn } = await import("node:child_process");
+  const args = ["run", ...permissionArgs(options.permissions), entrypoint];
+  if (options.denoArgs) args.splice(1, 0, ...options.denoArgs);
+  const child = cpSpawn(
+    Deno.execPath(),
+    args,
+    {
+      stdio: ["ipc", "pipe", "pipe"],
+      serialization: "advanced",
+    } as never,
+  );
+
+  let dead = false;
+  function kill(reason: unknown): void {
+    if (dead) return;
+    dead = true;
+    options.onDeath?.(reason);
+    try {
+      child.kill();
+    } catch {
+      // already exited
+    }
+  }
+
+  const transport = fromNodeIpc(
+    (message) => {
+      try {
+        return child.send(message as never);
+      } catch {
+        return false;
+      }
+    },
+    { onClosed: () => !dead && kill(new Error("Node process exited")) },
+  );
+  child.on("message", (message) => transport.deliver(message));
+  child.on("error", (err) => !dead && kill(err));
+
+  // Handshake: the node announces its actor names.
+  const actors = await new Promise<string[]>((resolve, reject) => {
+    const timeout = setTimeout(
+      () => reject(new Error("Node handshake timed out")),
+      10_000,
+    );
+    transport.onMessage((ev) => {
+      const frame = ev.data as { type?: string; actors?: string[] };
+      if (frame.type === "handshake") {
+        clearTimeout(timeout);
+        resolve(frame.actors ?? []);
+      }
+    });
+  });
+
+  // Open one channel per actor; each runs standard RPC frames over it.
+  const registry = new PayloadCodecRegistry();
+  for (
+    const codec of [iterableCodec, errorCodec, abortSignalCodec, callbackCodec]
+  ) {
+    if (!registry.has(codec.tag)) registry.register(codec);
+  }
+  const surface = {} as Record<string, unknown>;
+  for (const name of actors) {
+    const opened = transport.openChannel();
+    // Tell the node which actor this channel serves: the open token rides as
+    // a Mux control frame (the node's Mux opens the channel + acks), and the
+    // __open-actor frame names it. Both go on the main channel in order.
+    transport.send(opened.token);
+    transport.send({
+      type: "__open-actor",
+      name,
+      token: opened.token,
+    } as unknown as Frame);
+    const channel = opened.channel;
+    const proxy = createRpcProxy(registry, {
+      send: (request, transfer) =>
+        channel.send(
+          {
+            type: "request",
+            id: request.id,
+            method: request.method,
+            args: request.args,
+          } satisfies Frame,
+          transfer,
+        ),
+      isDead: () => channel.closed,
+      deadReason: () => new Error(`Actor "${name}" channel closed`),
+      transport,
+    });
+    channel.onMessage((message) => {
+      const frame = message as Frame;
+      if (frame.type === "response") proxy.deliver(frame);
+    });
+    surface[name] = new Proxy({} as object, {
+      get(_t, prop) {
+        if (prop === "then") return undefined;
+        if (typeof prop === "string") {
+          return (...args: unknown[]) => {
+            const p = proxy.call(prop, args);
+            attachLazyIterator(p);
+            return p;
+          };
+        }
+        return undefined;
+      },
+    });
+  }
+
+  const dispose = (): Promise<void> => {
+    if (dead) return Promise.resolve();
+    dead = true;
+    try {
+      transport.send({ type: "dispose" } satisfies Frame);
+    } finally {
+      transport.close();
+      kill(new Error("Node disposed"));
+    }
+    return Promise.resolve();
+  };
+
+  return Object.assign(surface, { dispose }) as never;
+}
