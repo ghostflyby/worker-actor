@@ -143,7 +143,9 @@ Deno.test("spawnProcess: abort still works after a stream was consumed (channel 
   );
   try {
     // Consume a stream first (opens/closes an iterable Mux channel).
-    for await (const _ of await actor.count(2)) {}
+    for await (const _ of await actor.count(2)) {
+      // drain the stream to trigger its channel close
+    }
     // Then an AbortSignal must still propagate.
     const controller = new AbortController();
     const running = actor.spin(5000, controller.signal);
