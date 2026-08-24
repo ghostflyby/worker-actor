@@ -1,36 +1,42 @@
 /**
  * Transport: the connection abstraction that unifies every actor channel type —
- * Worker MessagePort, fork IPC, process stdio, WebSocket, TCP. A Transport
- * carries the main message channel (RPC / control frames) and is responsible
- * for opening logical sub-channels via openChannel(), exactly like the
- * WebTransport shape (a connection + createBidirectionalStream()).
+ * Worker MessagePort, fork IPC, WebSocket, TCP. A Transport carries the main
+ * message channel (RPC / control frames) and is responsible for opening logical
+ * sub-channels via openChannel(), exactly like the WebTransport shape (a
+ * connection + createBidirectionalStream()).
  *
- * Two kinds:
+ * Kinds:
  *   - messageport: messages are delivered natively (structured clone);
  *     openChannel() produces a real MessagePort (transferred with the
  *     placeholder) — the natural channel-creation form in the structured-clone
  *     world.
- *   - framed: messages run through the frame layer (core/frame.ts, v8 +
- *     length prefix); openChannel() produces a { __mux: "open", ch } token and
+ *   - framed: messages run through the frame layer (core/frame.ts, v8 + length
+ *     prefix); openChannel() produces a { __mux: "open", ch } token and
  *     multiplexes the logical channel over the existing connection.
+ *   - message: values are delivered as discrete messages (fork IPC advanced,
+ *     WebSocket binary frames) — each message is one value, so the Mux protocol
+ *     rides directly on the messages with no byte framing.
  *
- * Channel establishment on a framed transport:
+ * Channel establishment on a Mux transport (framed / message):
  *   opener:  openChannel() → { channel, token }  (token = { __mux:"open", ch })
  *   opener:  sends the token to the peer inside a placeholder
  *   peer:    onMuxOpen → builds its end of channel ch → responds
  *            { __mux:"open", ch } back on the main channel
  *   opener:  receives the "open" control → resolves the pending channel
  *   either side may then send { __mux:"data", ch, value } frames
- *
- * The frame layer is pure WHATWG Streams (ReadableStream / WritableStream);
- * Node stream.Duplex is intentionally not bridged.
  */
 
 import type { Channel } from "./channel.ts";
 import { wrapPort } from "./channel.ts";
-import { createDecoder, createEncoder, type MuxFrame } from "./frame.ts";
+import {
+  createDecoder,
+  createEncoder,
+  deserialize,
+  type MuxFrame,
+  serialize,
+} from "./frame.ts";
 
-export type TransportKind = "messageport" | "framed";
+export type TransportKind = "messageport" | "framed" | "message";
 
 export interface Transport {
   readonly kind: TransportKind;
@@ -46,7 +52,7 @@ export interface Transport {
   /**
    * Open a new logical channel. Returns the local Channel plus the token to
    * hand to the peer: a MessagePort (transferable) on messageport transports,
-   * a { __mux: "open", ch } control value on framed transports. The peer
+   * a { __mux: "open", ch } control value on Mux transports. The peer
    * rebuilds the channel via onChannel.
    */
   openChannel(): { channel: Channel; token: unknown };
@@ -133,42 +139,38 @@ export function fromMessagePort(
   };
 }
 
-/** Internal marker on framed sub-channels: their Mux channel id. */ interface MuxChannel
-  extends Channel {
+/** Internal marker on Mux sub-channels: their Mux channel id. */
+interface MuxChannel extends Channel {
   _ch: number;
   _deliver(value: unknown): void;
 }
 
 /**
- * Create a `kind: "framed"` Transport over a WHATWG duplex byte stream
- * (ReadableStream + WritableStream<Uint8Array>, e.g. Deno.connect or process
- * stdio). The frame layer (createEncoder/createDecoder) is wired in, and
- * logical channels are multiplexed over the same connection via Mux control
- * frames. Channel establishment is opener-initiated: the local Channel is
- * completed when the peer's "open" control arrives back.
+ * Mux: the multiplexing engine shared by every non-messageport transport. It
+ * owns the channel table (open/close), the opener-initiated token handshake,
+ * and per-channel frame delivery. The transport supplies `write` (how to emit
+ * a Mux frame) and `deliver` (where inbound Mux frames come from).
  */
-export function framedTransport(
-  readable: ReadableStream<Uint8Array>,
-  writable: WritableStream<Uint8Array>,
+export interface Mux {
+  readonly kind: "framed" | "message";
+  onMessage(handler: (ev: TransportMessage) => void): void;
+  onChannel(handler: (channel: Channel) => void): void;
+  openChannel(): { channel: Channel; token: unknown };
+  send(frame: unknown): void;
+  deliver(frame: unknown): void;
+  close(): void;
+}
+
+export function createMux(
+  write: (frame: MuxFrame | unknown) => void,
   options: TransportOptions = {},
-): Transport {
-  const encoder = createEncoder();
-  const decoder = createDecoder();
+): Mux {
   const channels = new Map<number, MuxChannel>();
   const pending = new Map<number, MuxChannel>();
   let nextCh = 1;
   let handler: ((ev: TransportMessage) => void) | undefined;
   let channelHandler: ((channel: Channel) => void) | undefined;
   let closed = false;
-
-  function fail(): void {
-    if (closed) return;
-    closed = true;
-    for (const ch of channels.values()) ch.close();
-    channels.clear();
-    pending.clear();
-    options.onClosed?.();
-  }
 
   function makeChannel(ch: number): MuxChannel {
     let channelClosed = false;
@@ -179,14 +181,11 @@ export function framedTransport(
         return channelClosed;
       },
       get port(): MessagePort {
-        throw new Error("framed channels have no MessagePort");
+        throw new Error("Mux channels have no MessagePort");
       },
       send(message) {
         if (channelClosed) return;
-        const frame: MuxFrame = { __mux: "data", ch, value: message };
-        const writer = encoder.writable.getWriter();
-        void writer.write(frame);
-        writer.releaseLock();
+        write({ __mux: "data", ch, value: message } satisfies MuxFrame);
       },
       onMessage(h) {
         msgHandler = h;
@@ -195,10 +194,7 @@ export function framedTransport(
         if (channelClosed) return;
         channelClosed = true;
         channels.delete(ch);
-        const frame: MuxFrame = { __mux: "close", ch };
-        const writer = encoder.writable.getWriter();
-        void writer.write(frame);
-        writer.releaseLock();
+        write({ __mux: "close", ch } satisfies MuxFrame);
       },
       _deliver(value: unknown) {
         msgHandler?.(value);
@@ -207,45 +203,108 @@ export function framedTransport(
     return channel;
   }
 
-  function handleMux(frame: MuxFrame): void {
-    if (frame.__mux === "open") {
-      const pendingCh = pending.get(frame.ch);
+  function handle(frame: unknown): void {
+    if (frame === null || typeof frame !== "object") {
+      handler?.({ data: frame, ports: [] });
+      return;
+    }
+    const f = frame as MuxFrame;
+    if (f.__mux === "open") {
+      const pendingCh = pending.get(f.ch);
       if (pendingCh) {
         // opener: our openChannel()'s channel completes when the peer's open
         // control arrives back.
-        pending.delete(frame.ch);
-        channels.set(frame.ch, pendingCh);
+        pending.delete(f.ch);
+        channels.set(f.ch, pendingCh);
         return;
       }
       // peer-initiated: build our end, notify onChannel, and respond "open"
       // back so the opener's channel completes (bidirectional handshake).
-      const channel = makeChannel(frame.ch);
-      channels.set(frame.ch, channel);
+      const channel = makeChannel(f.ch);
+      channels.set(f.ch, channel);
       channelHandler?.(channel);
-      const ack: MuxFrame = { __mux: "open", ch: frame.ch };
-      const writer = encoder.writable.getWriter();
-      void writer.write(ack);
-      writer.releaseLock();
+      write({ __mux: "open", ch: f.ch } satisfies MuxFrame);
       return;
     }
-    if (frame.__mux === "close") {
-      const ch = channels.get(frame.ch) ?? pending.get(frame.ch);
+    if (f.__mux === "close") {
+      const ch = channels.get(f.ch) ?? pending.get(f.ch);
       if (ch) {
-        channels.delete(frame.ch);
-        pending.delete(frame.ch);
+        channels.delete(f.ch);
+        pending.delete(f.ch);
         ch.close();
       }
       return;
     }
-    // data
-    const ch = channels.get(frame.ch);
-    if (ch) {
-      ch._deliver(frame.value);
-      return;
+    if (f.__mux === "data") {
+      const ch = channels.get(f.ch);
+      if (ch) {
+        ch._deliver(f.value);
+        return;
+      }
     }
-    // unknown channel: fall back to the main handler
+    // unknown channel or non-Mux value: fall back to the main handler
     handler?.({ data: frame, ports: [] });
   }
+
+  return {
+    kind: "framed",
+    onMessage(h) {
+      handler = h;
+    },
+    onChannel(h) {
+      channelHandler = h;
+    },
+    openChannel() {
+      const ch = nextCh++;
+      const channel = makeChannel(ch);
+      pending.set(ch, channel);
+      return { channel, token: { __mux: "open", ch } satisfies MuxFrame };
+    },
+    send(frame) {
+      if (closed) return;
+      write(frame);
+    },
+    deliver(frame) {
+      if (closed) return;
+      handle(frame);
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      for (const ch of channels.values()) ch.close();
+      channels.clear();
+      pending.clear();
+      options.onClosed?.();
+    },
+  };
+}
+
+/**
+ * Create a `kind: "framed"` Transport over a WHATWG duplex byte stream
+ * (ReadableStream + WritableStream<Uint8Array>, e.g. Deno.connect or process
+ * stdio). The frame layer (createEncoder/createDecoder) is wired in, and
+ * logical channels are multiplexed over the same connection via Mux control
+ * frames.
+ */
+export function framedTransport(
+  readable: ReadableStream<Uint8Array>,
+  writable: WritableStream<Uint8Array>,
+  options: TransportOptions = {},
+): Transport {
+  const encoder = createEncoder();
+  const decoder = createDecoder();
+  const mux = createMux((frame) => {
+    const writer = encoder.writable.getWriter();
+    void writer.write(frame);
+    writer.releaseLock();
+  }, options);
+  let closed = false;
+
+  const fail = (): void => {
+    if (closed) return;
+    closed = true;
+    mux.close();
+  };
 
   // Inbound: byte stream → decoder → Mux dispatch. pipeThrough coordinates
   // backpressure between the source and the decoder so the decoder's readable
@@ -258,8 +317,9 @@ export function framedTransport(
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        handleMux(value as MuxFrame);
+        mux.deliver(value);
       }
+      mux.close();
     } catch {
       fail();
     }
@@ -287,34 +347,120 @@ export function framedTransport(
     get kind(): TransportKind {
       return "framed";
     },
-    send(frame) {
-      if (closed) return;
-      const writer = encoder.writable.getWriter();
-      void writer.write(frame);
-      writer.releaseLock();
+    send(frame, _transfer) {
+      mux.send(frame);
     },
     onMessage(h) {
-      handler = h;
+      mux.onMessage(h);
     },
     openChannel() {
-      const ch = nextCh++;
-      const channel = makeChannel(ch);
-      pending.set(ch, channel);
-      return {
-        channel,
-        token: { __mux: "open", ch } satisfies MuxFrame,
-      };
+      return mux.openChannel();
     },
     onChannel(h) {
-      channelHandler = h;
+      mux.onChannel(h);
     },
     close() {
       if (closed) return;
       closed = true;
-      for (const ch of channels.values()) ch.close();
-      channels.clear();
-      pending.clear();
-      options.onClosed?.();
+      mux.close();
     },
   };
+}
+
+/**
+ * Create a `kind: "message"` Transport over a message-oriented channel — a
+ * channel that delivers discrete values (each message is one value, with no
+ * byte framing needed). Examples: node:child_process fork IPC with
+ * serialization 'advanced' (each message is a v8 value), and WebSocket binary
+ * frames. Messages are fed in via `deliver` (called by the caller's message
+ * handler) and sent out via `send`.
+ *
+ * The Mux protocol rides directly on the messages: open/data/close are
+ * ordinary messages, so a fork-IPC or WebSocket channel multiplexes exactly
+ * like a framed connection.
+ */
+export interface MessageTransport extends Transport {
+  /** Feed an inbound message from the underlying channel into the Mux. */
+  deliver(message: unknown): void;
+}
+
+export function messageTransport(
+  options: {
+    send: (message: unknown) => void;
+    onClosed?: () => void;
+  },
+): MessageTransport {
+  const mux = createMux(options.send, {
+    onClosed: options.onClosed,
+  });
+  let closed = false;
+  return {
+    get kind(): TransportKind {
+      return "message";
+    },
+    send(frame, _transfer) {
+      mux.send(frame);
+    },
+    onMessage(h) {
+      mux.onMessage(h);
+    },
+    openChannel() {
+      return mux.openChannel();
+    },
+    onChannel(h) {
+      mux.onChannel(h);
+    },
+    deliver(message) {
+      mux.deliver(message);
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      mux.close();
+    },
+  };
+}
+
+/**
+ * node:child_process fork IPC Transport (message kind). Each IPC message is a
+ * v8-serialized value (serialization: 'advanced'), delivered as a discrete
+ * message — no byte framing needed, and the IPC channel is out-of-band from
+ * stdin/stdout/stderr so child logging cannot pollute the protocol.
+ *
+ * `deliver` must be wired to the child's 'message' event:
+ *   child.on("message", (msg) => transport.deliver(msg));
+ */
+export function fromNodeIpc(
+  send: (message: unknown, handle?: unknown) => boolean,
+  options: TransportOptions = {},
+): MessageTransport {
+  return messageTransport({
+    send: (message) => {
+      send(message);
+    },
+    onClosed: options.onClosed,
+  });
+}
+
+/**
+ * WebSocket Transport (message kind). Each binary message is one value: the
+ * frame layer is not needed (WS message boundaries are frame boundaries), and
+ * Mux multiplexes logical channels over the single WS connection.
+ *
+ * `deliver` must be wired to the socket's message handler:
+ *   ws.onmessage = (ev) => transport.deliver(ev.data);
+ */
+export function fromWebSocket(
+  socket: {
+    send(data: string | ArrayBuffer | ArrayBufferView): void;
+  },
+  options: TransportOptions = {},
+): MessageTransport {
+  return messageTransport({
+    send: (message) => {
+      // v8-serialize the value into a binary message (the WS message is the frame).
+      socket.send(serialize(message));
+    },
+    onClosed: options.onClosed,
+  });
 }

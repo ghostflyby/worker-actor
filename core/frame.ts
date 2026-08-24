@@ -18,6 +18,9 @@
 
 import { deserialize, serialize } from "node:v8";
 
+/** v8 serialize/deserialize, re-exported for message-kind transports (each message is one v8 value). */
+export { deserialize, serialize };
+
 const HEADER = 4; // UInt32LE length prefix
 
 /** Cap on a single frame payload; guards against corrupt/oversized length prefixes. */

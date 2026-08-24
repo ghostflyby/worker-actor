@@ -1,5 +1,9 @@
 import { assertEquals } from "@std/assert";
-import { framedTransport, fromMessagePort } from "./core/transport.ts";
+import {
+  framedTransport,
+  fromMessagePort,
+  messageTransport,
+} from "./core/transport.ts";
 import { connectChannel } from "./core/channel.ts";
 import type { Channel } from "./core/channel.ts";
 
@@ -11,6 +15,7 @@ interface Transport {
   ): void;
   openChannel(): { channel: Channel; token: unknown };
   onChannel(h: (channel: Channel) => void): void;
+  deliver?(message: unknown): void;
   close(): void;
 }
 
@@ -146,6 +151,80 @@ Deno.test("framedTransport: two channels multiplex over one connection", async (
     await until(() => gotB1.length === 2 && gotB2.length === 1),
     true,
   );
+  assertEquals(gotB1, [1, 3]);
+  assertEquals(gotB2, [2]);
+
+  a.close();
+  b.close();
+});
+
+/** Wire two message-kind transports (fork IPC / WebSocket style): send delivers directly. */
+function wireMessagePair(): { a: Transport; b: Transport } {
+  const a = messageTransport({
+    send: (m) => b.deliver(m),
+  });
+  const b = messageTransport({
+    send: (m) => a.deliver(m),
+  });
+  return { a, b };
+}
+
+Deno.test("messageTransport: main-channel messages round-trip (fork IPC / WS style)", async () => {
+  const { a, b } = wireMessagePair();
+  const got: unknown[] = [];
+  b.onMessage((ev) => got.push(ev.data));
+  a.send({ hello: "world" });
+  await until(() => got.length === 1);
+  assertEquals(got, [{ hello: "world" }]);
+  a.close();
+  b.close();
+});
+
+Deno.test("messageTransport: openChannel token handshake + data over Mux", async () => {
+  const { a, b } = wireMessagePair();
+  const peerChannels: Channel[] = [];
+  b.onChannel((ch) => peerChannels.push(ch));
+
+  const opened = a.openChannel();
+  a.send(opened.token);
+  await until(() => peerChannels.length === 1);
+
+  const gotA: unknown[] = [];
+  const gotB: unknown[] = [];
+  opened.channel.onMessage((v) => gotA.push(v));
+  peerChannels[0].onMessage((v) => gotB.push(v));
+
+  opened.channel.send("a->b");
+  await until(() => gotB.length === 1);
+  assertEquals(gotB, ["a->b"]);
+
+  peerChannels[0].send("b->a");
+  await until(() => gotA.length === 1);
+  assertEquals(gotA, ["b->a"]);
+
+  a.close();
+  b.close();
+});
+
+Deno.test("messageTransport: two channels multiplex over one connection", async () => {
+  const { a, b } = wireMessagePair();
+  const peerChannels: Channel[] = [];
+  b.onChannel((ch) => peerChannels.push(ch));
+
+  const c1 = a.openChannel();
+  const c2 = a.openChannel();
+  a.send(c1.token);
+  a.send(c2.token);
+  await until(() => peerChannels.length === 2);
+
+  const gotB1: unknown[] = [];
+  const gotB2: unknown[] = [];
+  peerChannels[0].onMessage((v) => gotB1.push(v));
+  peerChannels[1].onMessage((v) => gotB2.push(v));
+  c1.channel.send(1);
+  c2.channel.send(2);
+  c1.channel.send(3);
+  await until(() => gotB1.length === 2 && gotB2.length === 1);
   assertEquals(gotB1, [1, 3]);
   assertEquals(gotB2, [2]);
 
