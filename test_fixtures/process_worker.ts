@@ -11,6 +11,9 @@ export const rpc = {
   map(): Map<string, number> {
     return new Map([["a", 1], ["b", 2]]);
   },
+  async *count(n: number): AsyncIterable<number> {
+    for (let i = 0; i < n; i++) yield i;
+  },
 };
 
 serveProcess(rpc);

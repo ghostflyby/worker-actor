@@ -29,7 +29,11 @@
 import { type Frame, PROTOCOL_VERSION } from "./core/protocol.ts";
 import { type Codec, PayloadCodecRegistry } from "./core/codec.ts";
 import { type Channel, connectChannel } from "./core/channel.ts";
-import { fromNodeIpc, type Transport } from "./core/transport.ts";
+import {
+  fromMessagePort,
+  fromNodeIpc,
+  type Transport,
+} from "./core/transport.ts";
 import {
   dispatchControlFrame,
   setActiveRegistry,
@@ -119,17 +123,8 @@ export interface ServeWorkerOptions {
   onLink?: (link: LinkHandle) => void;
 }
 
-/** Transport-side send/receive: the runtime talks to a Transport, not to `self`. */
-interface RuntimeTransport {
-  send(frame: unknown, transfer?: Transferable[]): void;
-  onMessage(
-    handler: (ev: { data: unknown; ports: readonly MessagePort[] }) => void,
-  ): void;
-  close(): void;
-}
-
 /**
- * Shared RPC runtime over a Transport-shaped main channel. Handles request
+ * Shared RPC runtime over a Transport main channel. Handles request
  * frames (decode args → await → encode result), reference-acquire control
  * frames, the worker-id handshake and dispose. `linkHandlers` lets the
  * Worker-specific link mechanism register itself (process runtimes have no
@@ -138,7 +133,7 @@ interface RuntimeTransport {
 function createRuntime(
   api: WorkerApi,
   options: ServeWorkerOptions,
-  transport: RuntimeTransport,
+  transport: Transport,
   close: () => void,
 ): void {
   const registry = new PayloadCodecRegistry();
@@ -155,7 +150,7 @@ function createRuntime(
   }
   const links = new Map<string, Channel>();
   setActiveRegistry(registry);
-  const mainHandler = makeRpcHandler(api, registry);
+  const mainHandler = makeRpcHandler(api, registry, transport);
 
   transport.onMessage(async (ev) => {
     const frame = ev.data as Frame;
@@ -299,22 +294,27 @@ export function serveWorker(
   api: WorkerApi,
   options: ServeWorkerOptions = {},
 ): void {
-  createRuntime(
-    api,
-    options,
-    {
-      send(frame, transfer) {
-        self.postMessage(frame, transfer ? { transfer } : undefined);
-      },
-      onMessage(handler) {
-        self.onmessage = (ev) => handler({ data: ev.data, ports: ev.ports });
-      },
-      close() {
-        self.close();
-      },
+  // self is a DedicatedWorkerGlobalScope: wrap it as a MessagePort-shaped
+  // source so fromMessagePort yields a messageport-type Transport — the same
+  // abstraction every actor channel runs on (openChannel hands transferred
+  // ports, exactly like the main-thread Worker path).
+  const port = {
+    onmessage: null as ((ev: MessageEvent<unknown>) => void) | null,
+    postMessage(
+      message: unknown,
+      opts?: { transfer?: Transferable[] },
+    ): void {
+      self.postMessage(message, opts);
     },
-    () => self.close(),
-  );
+    close(): void {
+      self.close();
+    },
+  } as unknown as MessagePort;
+  const transport = fromMessagePort(port);
+  // Bridge the worker's inbound messages into the fake port's onmessage
+  // (fromMessagePort reads the port's onmessage).
+  self.onmessage = (ev) => port.onmessage?.(ev);
+  createRuntime(api, options, transport, () => self.close());
 }
 
 /**
@@ -352,18 +352,7 @@ export function serveProcess(
   createRuntime(
     api,
     options,
-    {
-      send(frame, transfer) {
-        // Message-kind transport ignores transferables (no MessagePort cross-process).
-        transport.send(frame);
-      },
-      onMessage(handler) {
-        transport.onMessage(handler);
-      },
-      close() {
-        transport.close();
-      },
-    },
+    transport,
     () => transport.close(),
   );
 }

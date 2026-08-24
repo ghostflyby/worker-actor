@@ -58,6 +58,8 @@ export interface Transport {
   openChannel(): { channel: Channel; token: unknown };
   /** Register the handler for channels opened by the peer (last handler wins). */
   onChannel(handler: (channel: Channel) => void): void;
+  /** Claim a peer-opened channel that arrived before its consumer connected (Mux transports). */
+  claimOrphan?(ch: number): Channel | undefined;
   /** Close the transport; idempotent. Closes the main channel and every sub-channel. */
   close(): void;
 }
@@ -158,6 +160,8 @@ export interface Mux {
   openChannel(): { channel: Channel; token: unknown };
   send(frame: unknown): void;
   deliver(frame: unknown): void;
+  /** Claim a peer-opened channel that arrived before its consumer connected. */
+  claimOrphan(ch: number): Channel | undefined;
   close(): void;
 }
 
@@ -167,6 +171,10 @@ export function createMux(
 ): Mux {
   const channels = new Map<number, MuxChannel>();
   const pending = new Map<number, MuxChannel>();
+  // Channels opened by the peer whose open control arrived before any
+  // consumer claimed them (decode-side connectToken runs later). connectToken
+  // claims these by id; until then they stay open so data isn't lost.
+  const orphaned = new Map<number, MuxChannel>();
   let nextCh = 1;
   let handler: ((ev: TransportMessage) => void) | undefined;
   let channelHandler: ((channel: Channel) => void) | undefined;
@@ -218,10 +226,11 @@ export function createMux(
         channels.set(f.ch, pendingCh);
         return;
       }
-      // peer-initiated: build our end, notify onChannel, and respond "open"
-      // back so the opener's channel completes (bidirectional handshake).
+      // peer-initiated: build our end. If a consumer (connectToken) has not
+      // claimed it yet, cache it as orphaned so the claim can find it later.
       const channel = makeChannel(f.ch);
       channels.set(f.ch, channel);
+      orphaned.set(f.ch, channel);
       channelHandler?.(channel);
       write({ __mux: "open", ch: f.ch } satisfies MuxFrame);
       return;
@@ -231,6 +240,7 @@ export function createMux(
       if (ch) {
         channels.delete(f.ch);
         pending.delete(f.ch);
+        orphaned.delete(f.ch);
         ch.close();
       }
       return;
@@ -268,12 +278,18 @@ export function createMux(
       if (closed) return;
       handle(frame);
     },
+    claimOrphan(ch) {
+      const orphan = orphaned.get(ch);
+      if (orphan) orphaned.delete(ch);
+      return orphan;
+    },
     close() {
       if (closed) return;
       closed = true;
       for (const ch of channels.values()) ch.close();
       channels.clear();
       pending.clear();
+      orphaned.clear();
       options.onClosed?.();
     },
   };
@@ -359,6 +375,9 @@ export function framedTransport(
     onChannel(h) {
       mux.onChannel(h);
     },
+    claimOrphan(ch) {
+      return mux.claimOrphan(ch);
+    },
     close() {
       if (closed) return;
       closed = true;
@@ -409,6 +428,9 @@ export function messageTransport(
     },
     onChannel(h) {
       mux.onChannel(h);
+    },
+    claimOrphan(ch) {
+      return mux.claimOrphan(ch);
     },
     deliver(message) {
       mux.deliver(message);

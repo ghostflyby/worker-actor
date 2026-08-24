@@ -77,8 +77,14 @@ export function openChannel(
   options?: ChannelOptions,
 ): ChannelPeer {
   const transport = ctx.transport;
-  if (transport.kind === "framed") {
+  // Mux transports (framed byte streams and message channels) establish
+  // logical channels via transport.openChannel(): the token is sent as a Mux
+  // control frame on the main channel (the peer's onChannel fires and acks),
+  // AND rides in the placeholder so the peer's decode can connect the token
+  // to the inbound channel.
+  if (transport.kind === "framed" || transport.kind === "message") {
     const opened = transport.openChannel();
+    transport.send(opened.token);
     return { channel: opened.channel, token: opened.token };
   }
   const { port1, port2 } = new MessageChannel();
@@ -139,6 +145,110 @@ export function wrapPort(
     close,
   };
 }
+
+/**
+ * A Mux channel carries an internal `_ch` id (set by createMux's makeChannel).
+ * Token-based channel establishment matches an inbound channel to a pending
+ * token by that id. Exported for the token-connection helper below.
+ */
+export interface MuxChannelShape extends Channel {
+  _ch?: number;
+}
+
+/**
+ * Resolve a Mux token ({ __mux: "open", ch }) to the peer's Channel on the
+ * transport. The channel may already have arrived (transport.onChannel fired
+ * before this call) or arrive later; the returned Channel is the same object
+ * either way. The transport's onChannel is registered once and dispatches to
+ * all pending tokens by channel id.
+ */
+export function connectToken(
+  transport: {
+    onChannel(h: (channel: Channel) => void): void;
+    claimOrphan?(ch: number): Channel | undefined;
+  },
+  token: { __mux: "open"; ch: number },
+): Channel {
+  const chId = token.ch;
+  // Per-transport dispatcher: one onChannel registration routes every inbound
+  // Mux channel to the pending entry for its id. Channels that arrived before
+  // any claim (orphaned in the Mux) are taken via claimOrphan.
+  let dispatcher = dispatchers.get(transport);
+  if (!dispatcher) {
+    const pendingByCh = new Map<number, PendingToken>();
+    transport.onChannel((channel) => {
+      const mux = channel as MuxChannelShape;
+      if (mux._ch === undefined) return;
+      const entry = pendingByCh.get(mux._ch);
+      if (entry) {
+        pendingByCh.delete(mux._ch);
+        entry.channel = channel;
+        entry.resolve?.();
+      }
+    });
+    dispatcher = { pendingByCh };
+    dispatchers.set(transport, dispatcher);
+  }
+  // The channel may already be orphaned in the Mux (open control arrived before
+  // decode). Claim it so its data isn't lost while we wait.
+  const orphan = transport.claimOrphan?.(chId);
+  if (orphan) {
+    const existing = dispatcher.pendingByCh.get(chId);
+    if (existing && !existing.channel) {
+      dispatcher.pendingByCh.delete(chId);
+      existing.channel = orphan;
+      existing.resolve?.();
+    }
+    return orphan;
+  }
+  const existing = dispatcher.pendingByCh.get(chId);
+  if (existing && existing.channel) return existing.channel;
+  // Not arrived yet (or arrived but unresolved): return a proxy that resolves
+  // once the channel arrives.
+  const entry: PendingToken = existing ?? {
+    channel: undefined,
+    resolve: undefined,
+  };
+  if (!existing) {
+    entry._ready = new Promise<void>((resolve) => {
+      entry.resolve = resolve;
+    });
+    dispatcher.pendingByCh.set(chId, entry);
+  }
+  const ready = entry._ready ?? Promise.resolve();
+  const proxy: Channel = {
+    get closed(): boolean {
+      return entry.channel?.closed ?? true;
+    },
+    get port(): MessagePort {
+      throw new Error("Mux channels have no MessagePort");
+    },
+    send(message, transfer) {
+      entry.channel?.send(message, transfer);
+    },
+    onMessage(h) {
+      if (entry.channel) entry.channel.onMessage(h);
+      else void ready.then(() => entry.channel!.onMessage(h));
+    },
+    close() {
+      entry.channel?.close();
+    },
+  };
+  return proxy;
+}
+
+interface PendingToken {
+  channel: Channel | undefined;
+  resolve: (() => void) | undefined;
+  _ready?: Promise<void>;
+}
+
+// Transport → pending-token dispatcher (module-level; a transport has exactly
+// one onChannel handler, shared by all tokens).
+const dispatchers = new WeakMap<
+  { onChannel(h: (channel: Channel) => void): void },
+  { pendingByCh: Map<number, PendingToken> }
+>();
 
 /** GC-based release: see the module docs. Returns an unregister function (call on explicit close). */
 export function registerRelease(

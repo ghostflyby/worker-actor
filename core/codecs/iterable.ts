@@ -27,12 +27,20 @@ import {
   type EncodeContext,
   getCodecState,
 } from "../codec.ts";
-import { connectChannel, openChannel, registerRelease } from "../channel.ts";
+import {
+  connectChannel,
+  connectToken,
+  openChannel,
+  registerRelease,
+} from "../channel.ts";
 import { createRemoteIterable, startStreamProducer } from "../stream.ts";
 
 interface StreamHandle {
   [CODEC_PLACEHOLDER_KEY]: "iterable";
-  port: MessagePort;
+  /** Messageport transports: the transferred peer port. */
+  port?: MessagePort;
+  /** Mux transports: the channel-establishment token. */
+  token?: unknown;
 }
 
 interface IterableCodecState {
@@ -97,7 +105,7 @@ function encode(value: AsyncIterable<unknown>, ctx: EncodeContext): unknown {
   const iterable = isAsyncIterable(value)
     ? value
     : toAsyncIterable(value as Iterable<unknown>);
-  const { channel, peerPort } = openChannel(ctx);
+  const { channel, peerPort, token } = openChannel(ctx);
   ctx.registry.registerChannel(channel);
   const state = getState(ctx);
   // stopFn self-removes from the registry once the stream ends (done/error/
@@ -108,20 +116,24 @@ function encode(value: AsyncIterable<unknown>, ctx: EncodeContext): unknown {
     state.producerStops.delete(stopFn);
   });
   state.producerStops.add(stopFn);
-  if (!peerPort) {
-    throw new Error("iterable codec requires a messageport transport");
-  }
-  return {
+  // Messageport transports hand over a port; Mux transports hand over a token.
+  const handle: StreamHandle = {
     [CODEC_PLACEHOLDER_KEY]: "iterable",
-    port: peerPort,
-  } satisfies StreamHandle;
+    ...(peerPort !== undefined ? { port: peerPort } : { token }),
+  };
+  return handle;
 }
 
 function decode(
-  placeholder: { port: MessagePort },
+  placeholder: { port?: MessagePort; token?: unknown },
   ctx: DecodeContext,
 ): AsyncIterable<unknown> {
-  const channel = connectChannel(placeholder.port);
+  const channel = placeholder.port !== undefined
+    ? connectChannel(placeholder.port)
+    : connectToken(
+      ctx.transport,
+      placeholder.token as { __mux: "open"; ch: number },
+    );
   ctx.registry.registerChannel(channel);
   const state = getState(ctx);
   let failFn: () => void = () => {};

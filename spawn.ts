@@ -327,6 +327,7 @@ export async function spawn<
         transfer,
       ),
     isDead: () => dead,
+    transport: worker,
   });
   // Assign a stable worker id (embedded in refIds) and register it for acquire
   // routing. The id is sent after the handshake so the worker is definitely

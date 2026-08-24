@@ -255,10 +255,10 @@ export class PayloadCodecRegistry {
   }
 
   /** After receiving: rebuild placeholders into original values (deeply nested, expanded automatically). */
-  decode(value: unknown): unknown {
+  decode(value: unknown, transport?: Transport): unknown {
     return this.#decodeWalk(
       value,
-      defaultMessagePortTransport(),
+      transport ?? defaultMessagePortTransport(),
       new WeakMap(),
     );
   }

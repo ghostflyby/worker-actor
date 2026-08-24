@@ -40,3 +40,22 @@ Deno.test("spawnProcess: signal aborts creation", async () => {
   ).then(() => "resolved", (e) => `rejected:${e.name}`);
   assertEquals(result.startsWith("rejected"), true);
 });
+
+Deno.test("spawnProcess: AsyncIterable streams across processes (Mux token)", async () => {
+  const actor = await spawnProcess<typeof ProcessWorker.rpc>(
+    "./test_fixtures/process_worker.ts",
+  );
+  try {
+    const stream = await Promise.race([
+      actor.count(5),
+      new Promise((_, rej) =>
+        setTimeout(() => rej(new Error("count() timeout")), 2000)
+      ),
+    ]) as AsyncIterable<number>;
+    const got: number[] = [];
+    for await (const n of stream) got.push(n);
+    assertEquals(got, [0, 1, 2, 3, 4]);
+  } finally {
+    await actor.dispose();
+  }
+});
