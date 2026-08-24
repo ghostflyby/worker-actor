@@ -256,7 +256,10 @@ export function createMux(
       return;
     }
     if (f.__mux === "data") {
-      const ch = channels.get(f.ch);
+      // Established channels AND orphaned (peer-opened, not yet claimed) ones:
+      // a data frame for an orphaned channel must reach it (it buffers until a
+      // handler is attached), or it would be lost before the consumer claims it.
+      const ch = channels.get(f.ch) ?? orphaned.get(f.ch);
       if (ch) {
         ch._deliver(f.value);
         return;

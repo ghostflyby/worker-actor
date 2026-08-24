@@ -40,8 +40,11 @@ export interface SerializedError {
 
 export type Frame =
   /** Sent by the worker once the module is loaded and its API is ready; spawn() waits for it.
-   *  codecs is the worker-side registered codec tag list, checked against the host's. */
-  | { type: "handshake"; version: number; codecs: string[] }
+   *  codecs is the worker-side registered codec tag list, checked against the host's.
+   *  kind is the transport kind (messageport / message / framed); a mismatch with
+   *  the host's transport rejects the handshake (a Mux transport must not be
+   *  treated as a messageport one). */
+  | { type: "handshake"; version: number; codecs: string[]; kind?: string }
   /** Main thread → worker: a single RPC call. args must be structured-cloneable. */
   | { type: "request"; id: number; method: string; args: unknown[] }
   /** Worker → main thread: call result; ok=false carries the serialized error. */

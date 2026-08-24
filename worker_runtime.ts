@@ -286,6 +286,7 @@ function createRuntime(
     type: "handshake",
     version: PROTOCOL_VERSION,
     codecs: registry.tags,
+    kind: transport.kind,
   });
 }
 
@@ -474,6 +475,7 @@ export function serveNode(
     type: "handshake",
     version: PROTOCOL_VERSION,
     codecs: registry.tags,
+    kind: transport.kind,
     actors: names,
   } as never);
 }

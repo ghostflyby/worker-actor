@@ -380,6 +380,17 @@ async function spawnOnTransport<
         );
         return;
       }
+      // Transport-kind mismatch: a Mux transport must not be treated as a
+      // messageport one (no MessagePort transfer across Mux). A peer that
+      // doesn't send kind (older protocol) is accepted as messageport.
+      if (frame.kind !== undefined && frame.kind !== worker.kind) {
+        kill(
+          new Error(
+            `Transport kind mismatch: worker speaks ${frame.kind}, host transport is ${worker.kind}`,
+          ),
+        );
+        return;
+      }
       // Tell the worker its id (for refIds); FIFO after the handshake.
       worker.send({ type: "__worker-id", id: workerId } satisfies Frame);
       resolveHandshake?.();
