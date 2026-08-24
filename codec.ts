@@ -35,12 +35,28 @@ export type { Codec, DecodeContext, EncodeContext } from "./core/codec.ts";
 
 export {
   connectChannel,
+  connectToken,
   openChannel,
   registerRelease,
 } from "./core/channel.ts";
-export type { Channel, ChannelOptions } from "./core/channel.ts";
+export type { Channel, ChannelOptions, ChannelPeer } from "./core/channel.ts";
+
+export { connectActor, openNodeActor } from "./core/connect.ts";
+export type { ConnectedActor } from "./core/connect.ts";
 
 export { createRemoteIterable, startStreamProducer } from "./core/stream.ts";
+
+export { createMux, messageTransport } from "./core/transport.ts";
+export type {
+  MessageTransport,
+  Mux,
+  Transport,
+  TransportKind,
+  TransportMessage,
+} from "./core/transport.ts";
+
+export { createActorRegistry } from "./core/registry.ts";
+export type { ActorRegistry } from "./core/registry.ts";
 
 export { createRpcProxy, makeRpcHandler } from "./core/rpc.ts";
 export type {
@@ -58,9 +74,11 @@ export type {
 export {
   dispatchControlFrame,
   getActiveRegistry,
+  getActiveTransport,
   getWorkerId,
   registerControlHandler,
   setActiveRegistry,
+  setActiveTransport,
   setMainAcquire,
   setWorkerId,
   triggerAcquire,

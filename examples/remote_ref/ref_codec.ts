@@ -35,7 +35,10 @@
  * of that holder's refs in one batch and posts a single __holder-dead notice to
  * the main thread. A holder whose pings stop fails its refs of that owner
  * (reverse detection). Frames below ride on the ref channel; liveness frames
- * ride on the pair channel.
+ * ride on the pair channel. The liveness plane is MESSAGEPORT-ONLY: over a Mux
+ * transport (process actors) the per-holder pair channel cannot be transferred,
+ * so acquires complete over a Mux ref channel without a liveness plane — the
+ * ref works, it just has no owner/holder death sweep (documented limitation).
  *
  * Lifecycle: explicit dispose(), GC-based release (FinalizationRegistry), and
  * failAll (the registry closes the channel). The owner runs the real object's
@@ -47,10 +50,12 @@ import {
   type Codec,
   CODEC_PLACEHOLDER_KEY,
   connectChannel,
+  connectToken,
   type ControlFrame,
   type DecodeContext,
   type EncodeContext,
   getActiveRegistry,
+  getActiveTransport,
   openChannel,
   registerControlHandler,
   registerRelease,
@@ -310,8 +315,10 @@ interface RefToken {
 interface RefHandle {
   [CODEC_PLACEHOLDER_KEY]: "remote-ref";
   refId: string;
-  /** Present on a fresh owner-produced reference; absent on a refId-only hand-off. */
+  /** Present on a fresh owner-produced reference on a messageport transport. */
   port?: MessagePort;
+  /** Present on a fresh owner-produced reference on a Mux transport (channel-establishment token). */
+  token?: unknown;
 }
 
 type RefFrame =
@@ -686,31 +693,149 @@ function materialize(
   }
 }
 
-/** __ref-acquired: the acquire-completion port arrived — materialize and flush. */
+/**
+ * Materialize a pending entry from a Mux token (instead of a port): the channel
+ * is established by the token on our transport. Liveness is skipped on Mux —
+ * the per-holder pair plane is messageport-only (documented in the module
+ * header); the ref still works, it just has no owner-death sweep.
+ */
+function materializeToken(
+  entry: PendingEntry,
+  transport: DecodeContext["transport"],
+  token: { __mux: "open"; ch: number },
+  liveness?: { ownerId?: string; livenessPort?: MessagePort },
+): void {
+  if (entry.real) {
+    closeTokenChannel(transport, token);
+    return;
+  }
+  const channel = connectToken(transport, token);
+  materializeChannel(entry, channel, liveness);
+}
+
+/**
+ * Materialize a pending entry from an already-connected Channel (the main-side
+ * local end of a Mux acquire, or a token-connected channel). The pending proxy
+ * stays the single entity for this refId — later calls forward to the real
+ * proxy — and is recorded in the dedupe table, so ANY later arrival path
+ * returns the same object. Identity is path-independent.
+ */
+function materializeChannel(
+  entry: PendingEntry,
+  channel: Channel,
+  liveness?: { ownerId?: string; livenessPort?: MessagePort },
+): void {
+  if (entry.real) {
+    channel.close(); // already materialized: the extra channel is redundant
+    return;
+  }
+  const registry = entry.registry;
+  registry.registerChannel(channel);
+  const pair = liveness
+    ? ensureHolderPair(liveness.ownerId, liveness.livenessPort)
+    : undefined;
+  const real = createRefProxy(channel, registry, entry.refId, () => {
+    // The real proxy's death does not end the ENTITY: identityByRefId keeps
+    // pointing at the pending proxy (the single entity), whose dispose is the
+    // entity's lifetime. Nothing to clean here.
+  });
+  // When the OWNER dies (reverse detection: its pings stop), this proxy — and
+  // every other proxy of that owner — fails together; no calls hang forever.
+  pair?.kills.add(() => {
+    real.dispose();
+  });
+  entry.real = real;
+  pendingByRefId.delete(entry.refId);
+  identityByRefId.set(entry.refId, new WeakRef(entry.proxy));
+  const calls = entry.calls;
+  entry.calls = [];
+  for (const c of calls) {
+    const p =
+      (real as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>)
+        [
+          c.method
+        ](...c.args);
+    p.then(c.resolve, c.reject);
+  }
+}
+
+/** The default (messageport-shaped) transport used by main-side decodes without a real transport. */
+function defaultTransport(): DecodeContext["transport"] {
+  return {
+    kind: "messageport",
+    send() {},
+    onMessage() {},
+    openChannel() {
+      throw new Error("no transport");
+    },
+    onChannel() {},
+    close() {},
+  };
+}
+
+/** Close the channel established by a Mux token (best-effort; the transport owns it). */
+function closeTokenChannel(
+  transport: DecodeContext["transport"],
+  token: unknown,
+): void {
+  if (typeof token !== "object" || token === null) return;
+  const t = token as { __mux?: unknown; ch?: unknown };
+  if (t.__mux !== "open" || typeof t.ch !== "number") return;
+  const orphan = transport.claimOrphan?.(t.ch);
+  if (orphan) orphan.close();
+}
+
+/** __ref-acquired: the acquire-completion port/token arrived — materialize and flush. */
 function onRefAcquiredInner(
   frame: {
     refId: string;
-    port: MessagePort;
+    port?: MessagePort;
+    token?: unknown;
+    channel?: Channel;
     ownerId?: string;
     livenessPort?: MessagePort;
   },
+  transport: DecodeContext["transport"],
+  channelOverride?: Channel,
 ): void {
   const entry = pendingByRefId.get(frame.refId);
   if (!entry) {
-    frame.port.close();
+    if (channelOverride !== undefined) channelOverride.close();
+    else if (frame.port !== undefined) frame.port.close();
+    else if (frame.token !== undefined) {
+      closeTokenChannel(transport, frame.token);
+    }
     return;
   }
-  materialize(entry, frame.port, {
-    ownerId: frame.ownerId,
-    livenessPort: frame.livenessPort,
-  });
+  if (channelOverride !== undefined) {
+    materializeChannel(entry, channelOverride, {
+      ownerId: frame.ownerId,
+      livenessPort: frame.livenessPort,
+    });
+    return;
+  }
+  if (frame.port !== undefined) {
+    materialize(entry, frame.port, {
+      ownerId: frame.ownerId,
+      livenessPort: frame.livenessPort,
+    });
+    return;
+  }
+  // Mux acquire: a token for the per-holder channel on OUR transport.
+  materializeToken(
+    entry,
+    transport,
+    frame.token as { __mux: "open"; ch: number },
+    { ownerId: frame.ownerId, livenessPort: frame.livenessPort },
+  );
 }
 
 /** __serve-ref: the owner must register a fresh per-holder channel for this ref. */
 function onServeRefInner(
   frame: {
     refId: string;
-    port: MessagePort;
+    port?: MessagePort;
+    token?: unknown;
     holderId?: string;
     livenessPort?: MessagePort;
   },
@@ -718,9 +843,32 @@ function onServeRefInner(
 ): void {
   const obj = objByRefId.get(frame.refId)?.deref();
   if (obj === undefined) {
-    frame.port.close(); // owner no longer holds the object: nothing to serve
+    // Owner no longer holds the object: nothing to serve. Close the arriving
+    // channel end (port or token) so neither side leaks the channel.
+    if (frame.port !== undefined) frame.port.close();
+    else if (frame.token !== undefined) {
+      closeTokenChannel(
+        getActiveTransport() ?? defaultTransport(),
+        frame.token,
+      );
+    }
     return;
   }
+  const transport = getActiveTransport();
+  if (frame.token !== undefined && transport !== undefined) {
+    // Mux path: no transferred port, and the liveness plane is messageport-only
+    // (per-holder pair channels). Connect the peer-opened channel on our
+    // transport and serve the ref over it.
+    const channel = connectToken(
+      transport,
+      frame.token as { __mux: "open"; ch: number },
+    );
+    registry.registerChannel(channel);
+    startRefOwner(channel, frame.refId, registry); // closure captures only the refId
+    trackOwnerChannel(frame.refId, channel, frame.holderId);
+    return;
+  }
+  if (frame.port === undefined) return;
   // Liveness plane (first serve of this holder only): owner-pull heartbeats.
   ensureOwnerPair(frame.holderId, frame.livenessPort);
   const channel = connectChannel(frame.port, {
@@ -739,22 +887,25 @@ const onWorkerId = (frame: ControlFrame): void => {
   workerIdPrefix = frame.refId; // reuse the refId field as the id carrier
 };
 const onRefAcquiredFrame = (frame: ControlFrame): void => {
-  // __ref-acquired always carries the transferred port; ignore malformed frames.
-  if (frame.port === undefined) return;
-  onRefAcquiredInner({
-    refId: frame.refId,
-    port: frame.port,
-    ownerId: frame.ownerId,
-    livenessPort: frame.livenessPort,
-  });
+  const transport = getActiveTransport();
+  // The Mux acquire path is local to the main thread: the requester is main,
+  // and the channel end is handed over directly (no wire frame).
+  if (frame.channel !== undefined) {
+    onRefAcquiredInner(frame, transport ?? defaultTransport(), frame.channel);
+    return;
+  }
+  if (frame.port === undefined && frame.token === undefined) return;
+  onRefAcquiredInner(frame, transport ?? defaultTransport());
 };
 const onServeRefFrame = (frame: ControlFrame): void => {
   const registry = getActiveRegistry();
   if (!registry) return; // no active worker registry (should not happen in a worker)
-  if (frame.port === undefined) return; // __serve-ref always carries the port
+  // __serve-ref carries either a transferred port or a Mux token.
+  if (frame.port === undefined && frame.token === undefined) return;
   onServeRefInner({
     refId: frame.refId,
     port: frame.port,
+    token: frame.token,
     holderId: frame.holderId,
     livenessPort: frame.livenessPort,
   }, registry);
@@ -831,7 +982,7 @@ export const remoteRefCodec: Codec<RemoteRef<unknown>> = {
       // closure captures only the refId, not the object.
       const obj = (ref as unknown as RefToken).obj as object;
       const refId = refIdFor(obj);
-      const { channel, peerPort } = openChannel(ctx, {
+      const { channel, peerPort, token } = openChannel(ctx, {
         onClosed: () => {
           untrackOwnerChannel(refId, channel);
           ctx.registry.unregisterChannel(channel);
@@ -841,11 +992,12 @@ export const remoteRefCodec: Codec<RemoteRef<unknown>> = {
       startRefOwner(channel, refId, ctx.registry);
       // Fresh tokens travel to the main thread only (no holder worker id).
       trackOwnerChannel(refId, channel, undefined);
-      return {
+      const handle: RefHandle = {
         [CODEC_PLACEHOLDER_KEY]: "remote-ref",
         refId,
-        port: peerPort,
-      } satisfies RefHandle;
+        ...(peerPort !== undefined ? { port: peerPort } : { token }),
+      };
+      return handle;
     }
     // Sharing semantics: a proxy encodes as its refId token only. The holder's
     // proxy stays alive; the receiver acquires a fresh per-holder channel via
@@ -858,17 +1010,18 @@ export const remoteRefCodec: Codec<RemoteRef<unknown>> = {
     } satisfies RefHandle;
   },
   decode(placeholder: RefHandle, ctx: DecodeContext): RemoteRef<unknown> {
-    const { refId, port } = placeholder;
+    const { refId, port, token } = placeholder;
     // Back to the owner? Restore a local call-through reference (collapse):
     // the reference completed its journey home; close any channels still open
-    // for it and call the real object directly. Works for both fresh (port
-    // present) and refId-only hand-off arrivals.
+    // for it and call the real object directly. Works for both fresh (port /
+    // token present) and refId-only hand-off arrivals.
     const obj = objByRefId.get(refId)?.deref();
     if (obj !== undefined) {
       // Restore: the reference came home. Under sharing semantics other
-      // holders keep their own channels, so only the arriving port (if any)
+      // holders keep their own channels, so only the arriving channel (if any)
       // is closed — never the whole per-holder set.
-      port?.close();
+      if (port !== undefined) port.close();
+      if (token !== undefined) closeTokenChannel(ctx.transport, token);
       return createLocalRef(obj);
     }
     // Identity is path- and registry-independent: every arrival for a refId
@@ -877,17 +1030,25 @@ export const remoteRefCodec: Codec<RemoteRef<unknown>> = {
     // `===` therefore holds across all arrival paths.
     const existing = identityByRefId.get(refId)?.deref();
     if (existing) {
-      port?.close(); // entity exists (pending or direct): extra port is redundant
+      if (port !== undefined) port.close();
+      if (token !== undefined) closeTokenChannel(ctx.transport, token);
       return existing;
     }
     const entry = pendingByRefId.get(refId);
     if (entry) {
       // Already known as a pending (refId-only) arrival: attach this direct
-      // port if one arrived — the pending proxy becomes the single entity.
+      // channel if one arrived — the pending proxy becomes the single entity.
       if (port !== undefined) materialize(entry, port);
+      else if (token !== undefined) {
+        materializeToken(
+          entry,
+          ctx.transport,
+          token as { __mux: "open"; ch: number },
+        );
+      }
       return entry.proxy;
     }
-    if (port === undefined) {
+    if (port === undefined && token === undefined) {
       // A refId-only hand-off arrived at a non-owner. The identity travels;
       // the channel is a per-holder connection that must be established via
       // the main thread (the only peer that can route between workers). Return
@@ -896,7 +1057,9 @@ export const remoteRefCodec: Codec<RemoteRef<unknown>> = {
     }
     // First direct arrival: create the entity and register it in the identity
     // table (subsequent arrivals of any path return the same object).
-    const channel = connectChannel(port);
+    const channel = port !== undefined
+      ? connectChannel(port)
+      : connectToken(ctx.transport, token as { __mux: "open"; ch: number });
     ctx.registry.registerChannel(channel);
     const proxy = createRefProxy(channel, ctx.registry, refId, () => {
       identityByRefId.delete(refId);

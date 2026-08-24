@@ -20,6 +20,7 @@ import {
   serializeError,
 } from "./protocol.ts";
 import type { PayloadCodecRegistry } from "./codec.ts";
+import type { Transport } from "./transport.ts";
 
 // The RPC boundary is inherently dynamic; concrete method types are derived by
 // Remote<T>/PeerRpc on the calling side.
@@ -70,6 +71,7 @@ export type RpcResponse =
 export function makeRpcHandler(
   api: RpcApi,
   registry: PayloadCodecRegistry,
+  transport?: Transport,
 ): (request: RpcRequest) => Promise<RpcResult> {
   return async (request) => {
     const fn = api[request.method];
@@ -83,13 +85,13 @@ export function makeRpcHandler(
       };
     }
     try {
-      const args = registry.decode(request.args) as unknown[];
+      const args = registry.decode(request.args, transport) as unknown[];
       const value = await fn(...args);
       const transfer: Transferable[] = [];
       return {
         ok: true,
         id: request.id,
-        value: registry.encode(value, transfer),
+        value: registry.encode(value, transfer, transport),
         transfer,
       };
     } catch (e) {
@@ -107,6 +109,8 @@ export interface RpcProxyOptions {
   isDead?: () => boolean;
   /** Rejection reason for calls made after death (default ActorDiedError). */
   deadReason?: () => Error;
+  /** The transport this proxy encodes/decodes over (Mux-aware codec values). */
+  transport?: Transport;
 }
 
 export interface RpcProxy {
@@ -138,7 +142,15 @@ export function createRpcProxy(
         pending.set(id, { resolve, reject });
         const transfer: Transferable[] = [];
         options.send(
-          { id, method, args: registry.encode(args, transfer) as unknown[] },
+          {
+            id,
+            method,
+            args: registry.encode(
+              args,
+              transfer,
+              options.transport,
+            ) as unknown[],
+          },
           transfer,
         );
       });
@@ -147,8 +159,9 @@ export function createRpcProxy(
       const call = pending.get(response.id);
       if (!call) return; // unknown id: possibly a late response after close
       pending.delete(response.id);
-      if (response.ok) call.resolve(registry.decode(response.value));
-      else call.reject(new RemoteError(response.error));
+      if (response.ok) {
+        call.resolve(registry.decode(response.value, options.transport));
+      } else call.reject(new RemoteError(response.error));
     },
     rejectAll(reason): void {
       for (const call of pending.values()) call.reject(reason);

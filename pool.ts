@@ -31,6 +31,7 @@
 
 import { ActorDiedError } from "./core/protocol.ts";
 import type { Codec } from "./core/codec.ts";
+import type { Transport } from "./core/transport.ts";
 import { attachLazyIterator, spawn } from "./spawn.ts";
 import type { ActorHandle, Remote } from "./spawn.ts";
 import type { CodecValueTypes } from "./core/type-utils.ts";
@@ -40,8 +41,8 @@ export interface ActorPoolOptions<
 > {
   /** Number of members. Default 1. */
   size?: number;
-  /** Factory for a member's Worker; called once per member (and per replace). */
-  spawnWorker: () => Worker;
+  /** Factory for a member's Worker or Transport; called once per member (and per replace). */
+  spawnWorker: () => Worker | Transport;
   /** Codecs passed to every member's spawn (per-member handshake fingerprint).
    *  An `as const` tuple also drives the type projection of each member's
    *  Remote<T> surface, exactly like spawn's codecs option. */
@@ -54,7 +55,7 @@ export interface ActorPoolOptions<
     | "least-busy"
     | ((method: string, args: unknown[]) => number);
   /** Auto-rebuild a member that died (crash/handshake failure). Default false. */
-  replace?: boolean | (() => Worker);
+  replace?: boolean | (() => Worker | Transport);
   /** Fired when a member dies (crash/handshake failure; not dispose). */
   onMemberDead?: (index: number, reason: unknown) => void;
 }

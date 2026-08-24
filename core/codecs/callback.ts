@@ -37,6 +37,7 @@ import {
 import {
   type Channel,
   connectChannel,
+  connectToken,
   openChannel,
   registerRelease,
 } from "../channel.ts";
@@ -61,7 +62,10 @@ export type RemoteCallback<A extends unknown[] = unknown[], R = unknown> =
 
 interface CallbackHandle {
   [CODEC_PLACEHOLDER_KEY]: "callback";
-  port: MessagePort;
+  /** Messageport transports: the transferred peer port. */
+  port?: MessagePort;
+  /** Mux transports: the channel-establishment token. */
+  token?: unknown;
 }
 
 type CallbackFrame =
@@ -118,7 +122,7 @@ function encode(fn: AnyFunction, ctx: EncodeContext): unknown {
         "transmittable (functions travel by reference)",
     );
   }
-  const { channel, peerPort } = openChannel(ctx, {
+  const { channel, peerPort, token } = openChannel(ctx, {
     onClosed: () => {
       // The channel is done: drop the strong hold and the registry pin, so a
       // released callback (and its closure) is collectable.
@@ -168,10 +172,11 @@ function encode(fn: AnyFunction, ctx: EncodeContext): unknown {
       channel.close();
     }
   });
-  return {
+  const handle: CallbackHandle = {
     [CODEC_PLACEHOLDER_KEY]: "callback",
-    port: peerPort,
-  } satisfies CallbackHandle;
+    ...(peerPort !== undefined ? { port: peerPort } : { token }),
+  };
+  return handle;
 }
 
 // Owner-side strong hold: while a callback channel is open, the owner holds
@@ -194,9 +199,14 @@ function decode(
   placeholder: CallbackHandle,
   ctx: DecodeContext,
 ): RemoteCallback {
-  const channel = connectChannel(placeholder.port, {
-    onClosed: () => ctx.registry.unregisterChannel(channel),
-  });
+  const channel = placeholder.port !== undefined
+    ? connectChannel(placeholder.port, {
+      onClosed: () => ctx.registry.unregisterChannel(channel),
+    })
+    : connectToken(
+      ctx.transport,
+      placeholder.token as { __mux: "open"; ch: number },
+    );
   ctx.registry.registerChannel(channel);
   const state = getState(ctx);
   const proxy = createRpcProxy(ctx.registry, {

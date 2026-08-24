@@ -40,7 +40,7 @@ import {
   type EncodeContext,
   getCodecState,
 } from "../codec.ts";
-import { connectChannel, openChannel } from "../channel.ts";
+import { connectChannel, connectToken, openChannel } from "../channel.ts";
 
 interface AbortFrame {
   type: "status" | "abort" | "release";
@@ -50,7 +50,10 @@ interface AbortFrame {
 
 interface AbortSignalHandle {
   [CODEC_PLACEHOLDER_KEY]: "abort-signal";
-  port: MessagePort;
+  /** Messageport transports: the transferred peer port. */
+  port?: MessagePort;
+  /** Mux transports: the channel-establishment token. */
+  token?: unknown;
 }
 
 interface AbortCodecState {
@@ -72,7 +75,7 @@ function getState(ctx: { codecState: Map<Codec, unknown> }): AbortCodecState {
 }
 
 function encode(signal: AbortSignal, ctx: EncodeContext): unknown {
-  const { channel, peerPort } = openChannel(ctx);
+  const { channel, peerPort, token } = openChannel(ctx);
   ctx.registry.registerChannel(channel);
   const state = getState(ctx);
   let stopped = false;
@@ -103,10 +106,11 @@ function encode(signal: AbortSignal, ctx: EncodeContext): unknown {
     signal.addEventListener("abort", onAbort, { once: true });
   }
   state.senders.add(cleanup);
-  return {
+  const handle: AbortSignalHandle = {
     [CODEC_PLACEHOLDER_KEY]: "abort-signal",
-    port: peerPort,
-  } satisfies AbortSignalHandle;
+    ...(peerPort !== undefined ? { port: peerPort } : { token }),
+  };
+  return handle;
 }
 
 function decode(
@@ -115,9 +119,14 @@ function decode(
 ): AbortSignal {
   const controller = new AbortController();
   const state = getState(ctx);
-  const channel = connectChannel(placeholder.port, {
-    onMessageError: () => teardown(true),
-  });
+  const channel = placeholder.port !== undefined
+    ? connectChannel(placeholder.port, {
+      onMessageError: () => teardown(true),
+    })
+    : connectToken(
+      ctx.transport,
+      placeholder.token as { __mux: "open"; ch: number },
+    );
   ctx.registry.registerChannel(channel);
   let closed = false;
 

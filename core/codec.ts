@@ -27,6 +27,7 @@
 export const CODEC_PLACEHOLDER_KEY = "__wCodec";
 
 import type { Channel } from "./channel.ts";
+import type { Transport } from "./transport.ts";
 
 export interface EncodeContext {
   /** structured clone transfer list: ports etc. created by codecs are pushed here. */
@@ -40,12 +41,22 @@ export interface EncodeContext {
    * streams or other codec values) and to track channels for failAll cleanup.
    */
   registry: PayloadCodecRegistry;
+  /**
+   * The transport this encode runs over. Codecs that need a logical channel
+   * (streams, abort signals, by-ref references) use transport.openChannel()
+   * — via core/channel.ts openChannel(ctx) — instead of assuming they can
+   * transfer a MessagePort. Defaults to a messageport-type transport so
+   * existing codecs keep working without a transport in context.
+   */
+  transport: Transport;
 }
 
 export interface DecodeContext {
   seen: WeakMap<object, unknown>;
   codecState: Map<Codec, unknown>;
   registry: PayloadCodecRegistry;
+  /** The transport this decode runs over; codecs use it to open/connect sub-channels. */
+  transport: Transport;
 }
 
 export interface Codec<T = unknown> {
@@ -155,13 +166,23 @@ export class PayloadCodecRegistry {
   }
 
   /** Before sending: replace deeply nested custom values with placeholders; transferred ports go into `transfer`. */
-  encode(value: unknown, transfer: Transferable[]): unknown {
-    return this.#encodeWalk(value, transfer, new WeakMap());
+  encode(
+    value: unknown,
+    transfer: Transferable[],
+    transport?: Transport,
+  ): unknown {
+    return this.#encodeWalk(
+      value,
+      transfer,
+      transport ?? defaultMessagePortTransport(),
+      new WeakMap(),
+    );
   }
 
   #encodeWalk(
     v: unknown,
     transfer: Transferable[],
+    transport: Transport,
     seen: WeakMap<object, unknown>,
   ): unknown {
     // Functions are objects too: consult the seen map for them, and run the
@@ -180,6 +201,7 @@ export class PayloadCodecRegistry {
           seen,
           codecState: this.#codecState,
           registry: this,
+          transport,
         });
         if (v !== null && (typeof v === "object" || typeof v === "function")) {
           seen.set(v as object, placeholder);
@@ -192,7 +214,7 @@ export class PayloadCodecRegistry {
       const out = new Array<unknown>(v.length);
       seen.set(v, out);
       for (let i = 0; i < v.length; i++) {
-        out[i] = this.#encodeWalk(v[i], transfer, seen);
+        out[i] = this.#encodeWalk(v[i], transfer, transport, seen);
       }
       return out;
     }
@@ -201,8 +223,8 @@ export class PayloadCodecRegistry {
       seen.set(v, out);
       for (const [k, val] of v) {
         out.set(
-          this.#encodeWalk(k, transfer, seen),
-          this.#encodeWalk(val, transfer, seen),
+          this.#encodeWalk(k, transfer, transport, seen),
+          this.#encodeWalk(val, transfer, transport, seen),
         );
       }
       return out;
@@ -210,7 +232,9 @@ export class PayloadCodecRegistry {
     if (v instanceof Set) {
       const out = new Set<unknown>();
       seen.set(v, out);
-      for (const val of v) out.add(this.#encodeWalk(val, transfer, seen));
+      for (const val of v) {
+        out.add(this.#encodeWalk(val, transfer, transport, seen));
+      }
       return out;
     }
     if (isPlainObject(v)) {
@@ -220,6 +244,7 @@ export class PayloadCodecRegistry {
         out[key] = this.#encodeWalk(
           (v as Record<string, unknown>)[key],
           transfer,
+          transport,
           seen,
         );
       }
@@ -230,11 +255,19 @@ export class PayloadCodecRegistry {
   }
 
   /** After receiving: rebuild placeholders into original values (deeply nested, expanded automatically). */
-  decode(value: unknown): unknown {
-    return this.#decodeWalk(value, new WeakMap());
+  decode(value: unknown, transport?: Transport): unknown {
+    return this.#decodeWalk(
+      value,
+      transport ?? defaultMessagePortTransport(),
+      new WeakMap(),
+    );
   }
 
-  #decodeWalk(v: unknown, seen: WeakMap<object, unknown>): unknown {
+  #decodeWalk(
+    v: unknown,
+    transport: Transport,
+    seen: WeakMap<object, unknown>,
+  ): unknown {
     if (v === null || typeof v !== "object") return v;
     const cached = seen.get(v);
     if (cached !== undefined) return cached;
@@ -250,6 +283,7 @@ export class PayloadCodecRegistry {
         seen,
         codecState: this.#codecState,
         registry: this,
+        transport,
       });
       seen.set(v, decoded);
       return decoded;
@@ -257,28 +291,37 @@ export class PayloadCodecRegistry {
     if (Array.isArray(v)) {
       const out = new Array<unknown>(v.length);
       seen.set(v, out);
-      for (let i = 0; i < v.length; i++) out[i] = this.#decodeWalk(v[i], seen);
+      for (let i = 0; i < v.length; i++) {
+        out[i] = this.#decodeWalk(v[i], transport, seen);
+      }
       return out;
     }
     if (v instanceof Map) {
       const out = new Map<unknown, unknown>();
       seen.set(v, out);
       for (const [k, val] of v) {
-        out.set(this.#decodeWalk(k, seen), this.#decodeWalk(val, seen));
+        out.set(
+          this.#decodeWalk(k, transport, seen),
+          this.#decodeWalk(val, transport, seen),
+        );
       }
       return out;
     }
     if (v instanceof Set) {
       const out = new Set<unknown>();
       seen.set(v, out);
-      for (const val of v) out.add(this.#decodeWalk(val, seen));
+      for (const val of v) out.add(this.#decodeWalk(val, transport, seen));
       return out;
     }
     if (isPlainObject(v)) {
       const out: Record<string, unknown> = {};
       seen.set(v, out);
       for (const key of Object.keys(v)) {
-        out[key] = this.#decodeWalk((v as Record<string, unknown>)[key], seen);
+        out[key] = this.#decodeWalk(
+          (v as Record<string, unknown>)[key],
+          transport,
+          seen,
+        );
       }
       return out;
     }
@@ -293,4 +336,44 @@ export class PayloadCodecRegistry {
     for (const channel of this.#channels) channel.close();
     this.#channels.clear();
   }
+}
+
+/**
+ * Default transport for codec encode/decode paths that do not carry a
+ * transport in context (e.g. decode in the RPC layer). A messageport-type
+ * no-op transport: existing codecs that only use openChannel/transfer keep
+ * working unchanged; a transport-aware codec only activates on a real
+ * transport.
+ */
+let defaultTransport: Transport | undefined;
+function defaultMessagePortTransport(): Transport {
+  if (!defaultTransport) {
+    const { port2 } = new MessageChannel();
+    // Keep port2 referenced so the port pair stays open.
+    void port2;
+    defaultTransport = {
+      kind: "messageport",
+      send() {},
+      onMessage() {},
+      openChannel() {
+        const { port1: p1, port2: p2 } = new MessageChannel();
+        return {
+          channel: {
+            closed: false,
+            port: p1,
+            kind: "messageport",
+            send() {},
+            onMessage() {},
+            close() {
+              p1.close();
+            },
+          },
+          token: p2,
+        };
+      },
+      onChannel() {},
+      close() {},
+    };
+  }
+  return defaultTransport;
 }

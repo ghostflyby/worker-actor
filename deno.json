@@ -1,6 +1,6 @@
 {
   "name": "@ghostflyby/worker-actor",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "license": "Apache-2.0",
   "publish": {
     "exclude": [
@@ -10,6 +10,7 @@
       "DESIGN.md",
       "OWNERSHIP.md",
       "PLUGIN-SYSTEM.md",
+      "TRANSPORT.md",
       "deno.lock",
       "examples/",
       "test_fixtures/",
@@ -19,6 +20,12 @@
   "tasks": {
     "demo": "deno run --allow-read examples/calculator/main.ts",
     "demo:ref": "deno run --allow-read examples/remote_ref/main.ts",
+    "demo:process": "deno run --allow-read --allow-run --allow-env examples/process_actor/main.ts",
+    "demo:cross-ref": "deno run --allow-read --allow-run --allow-env examples/cross_process_ref/main.ts",
+    "demo:node": "deno run --allow-read --allow-run --allow-env examples/actor_node/main.ts",
+    "demo:mixed": "deno run --allow-read --allow-run --allow-env examples/mixed_topology/main.ts",
+    "demo:ws-server": "deno run --allow-net examples/websocket_actor/server.ts",
+    "demo:ws-client": "deno run --allow-net examples/websocket_actor/client.ts",
     "test": "deno test --allow-read"
   },
   "imports": {

@@ -17,7 +17,7 @@ import {
   PROTOCOL_VERSION,
 } from "./core/protocol.ts";
 import { type Codec, PayloadCodecRegistry } from "./core/codec.ts";
-import { createRpcProxy } from "./core/rpc.ts";
+import { createRpcProxy, type RpcProxy } from "./core/rpc.ts";
 import type { CodecValueTypes, TransformCallbacks } from "./core/type-utils.ts";
 import {
   type ControlFrame,
@@ -28,6 +28,8 @@ import { iterableCodec } from "./core/codecs/iterable.ts";
 import { errorCodec } from "./core/codecs/error.ts";
 import { abortSignalCodec } from "./core/codecs/abort_signal.ts";
 import { callbackCodec } from "./core/codecs/callback.ts";
+import { fromMessagePort, type Transport } from "./core/transport.ts";
+import { fromNodeIpc } from "./core/transport.ts";
 
 // The RPC boundary is inherently dynamic: type safety comes from Remote<T>
 // deriving the worker's concrete signatures, and this any only serves shape
@@ -124,25 +126,94 @@ export interface SpawnOptions<
 
 const HANDSHAKE_TIMEOUT = 10_000;
 
-// Reference-acquire routing: each spawned worker gets a stable id (embedded in
-// refIds as a prefix), so the main thread can resolve "refId → owner worker"
-// and bootstrap an owner↔requester channel on demand. The requester is either
-// a worker (a __acquire-ref frame arrived from it) or the main thread itself.
-let nextWorkerId = 1;
-const workersById = new Map<string, Worker>();
-// Reverse lookup for acquire routing: the requester is a Worker; its id is the
-// holder identity for the liveness plane (one channel per owner↔holder pair).
-const workerIdByWorker = new Map<Worker, string>();
+// Reference-acquire routing: each spawned actor gets a stable transport id
+// (embedded in refIds as a prefix), so the coordinator can resolve
+// "refId → owner transport" and bootstrap an owner↔requester channel on
+// demand. This is the pluggable ActorRegistry — the minimal discovery layer.
+import { type ActorRegistry, createActorRegistry } from "./core/registry.ts";
+
+const actorRegistry = createActorRegistry();
+
+/**
+ * The coordinator's actor registry (exported for diagnostics / advanced
+ * routing). The registry resolves "transport id → Transport", which is how
+ * acquire frames and cross-connection connects route to the right peer.
+ */
+export function getActorRegistry(): ActorRegistry {
+  return actorRegistry;
+}
 // Established (owner, holder) pairs: the liveness channel is created once per
 // pair, on the first serve; later serves reuse it on both sides.
 const livenessPairs = new Set<string>();
 
-function routeAcquire(refId: string, requester: Worker): void {
-  // refId format: "<ownerWorkerId>:<localCount>"
+function routeAcquire(refId: string, requester: Transport): void {
+  // refId format: "<ownerId>:<localCount>"
   const ownerId = refId.slice(0, refId.indexOf(":"));
-  const owner = workersById.get(ownerId);
+  const owner = actorRegistry.resolve(ownerId);
   if (!owner) return; // unknown or dead owner: nothing to bootstrap
-  const requesterId = workerIdByWorker.get(requester);
+  const requesterId = actorRegistry.idOf(requester);
+  if (owner.kind !== "messageport" || requester.kind !== "messageport") {
+    // Mux involved: a MessagePort cannot be transferred over a Mux connection.
+    // Bootstrap one channel end on the owner's transport and another on the
+    // requester's transport, then relay frames between them here on the main
+    // thread. Each side gets its native channel form: a transferred port on a
+    // messageport transport, a Mux token otherwise. The liveness plane is
+    // messageport-only; Mux acquires skip it (see the remote-ref codec docs).
+    const ownerEnd = owner.openChannel();
+    const requesterEnd = requester.openChannel();
+    // Bridge first so no frame is dropped: owner calls/results and the requester
+    // proxy's calls/results flow through the relay, both directions.
+    ownerEnd.channel.onMessage((m) => requesterEnd.channel.send(m));
+    requesterEnd.channel.onMessage((m) => ownerEnd.channel.send(m));
+    if (owner.kind === "messageport") {
+      // Owner is a messageport transport: hand over the port by transfer.
+      const port = ownerEnd.token as MessagePort;
+      owner.send(
+        {
+          type: "__serve-ref",
+          refId,
+          port,
+          holderId: requesterId,
+        } satisfies Frame,
+        [port],
+      );
+    } else {
+      const token = ownerEnd.token;
+      owner.send(token);
+      owner.send(
+        {
+          type: "__serve-ref",
+          refId,
+          token,
+          holderId: requesterId,
+        } satisfies Frame,
+      );
+    }
+    if (requester.kind === "messageport") {
+      const port = requesterEnd.token as MessagePort;
+      requester.send(
+        {
+          type: "__ref-acquired",
+          refId,
+          port,
+          ownerId,
+        } satisfies Frame,
+        [port],
+      );
+    } else {
+      const token = requesterEnd.token;
+      requester.send(token);
+      requester.send(
+        {
+          type: "__ref-acquired",
+          refId,
+          token,
+          ownerId,
+        } satisfies Frame,
+      );
+    }
+    return;
+  }
   const { port1, port2 } = new MessageChannel();
   const transfer1: Transferable[] = [port1];
   const transfer2: Transferable[] = [port2];
@@ -161,7 +232,7 @@ function routeAcquire(refId: string, requester: Worker): void {
     transfer1.push(lc.port1);
     transfer2.push(lc.port2);
   }
-  owner.postMessage(
+  owner.send(
     {
       type: "__serve-ref",
       refId,
@@ -169,9 +240,9 @@ function routeAcquire(refId: string, requester: Worker): void {
       holderId: requesterId,
       livenessPort: livenessPort1,
     } satisfies Frame,
-    { transfer: transfer1 },
+    transfer1,
   );
-  requester.postMessage(
+  requester.send(
     {
       type: "__ref-acquired",
       refId,
@@ -179,21 +250,35 @@ function routeAcquire(refId: string, requester: Worker): void {
       ownerId,
       livenessPort: livenessPort2,
     } satisfies Frame,
-    { transfer: transfer2 },
+    transfer2,
   );
 }
 
 /** Main-side acquire: the main thread itself is the requester (materialize locally). */
 function routeAcquireMain(refId: string): void {
   const ownerId = refId.slice(0, refId.indexOf(":"));
-  const owner = workersById.get(ownerId);
+  const owner = actorRegistry.resolve(ownerId);
   if (!owner) return;
+  if (owner.kind !== "messageport") {
+    // Mux owner: open a channel on the owner's transport and materialize the
+    // main-side pending using the LOCAL channel end directly (no relay needed —
+    // the main thread owns one end and the owner serves the other).
+    const opened = owner.openChannel();
+    owner.send(opened.token);
+    owner.send(
+      { type: "__serve-ref", refId, token: opened.token } satisfies Frame,
+    );
+    dispatchControlFrame({
+      type: "__ref-acquired",
+      refId,
+      channel: opened.channel,
+    });
+    return;
+  }
   const { port1, port2 } = new MessageChannel();
-  owner.postMessage(
+  owner.send(
     { type: "__serve-ref", refId, port: port1 } satisfies Frame,
-    {
-      transfer: [port1],
-    },
+    [port1],
   );
   dispatchControlFrame({ type: "__ref-acquired", refId, port: port2 });
 }
@@ -275,12 +360,35 @@ export function link(a: Worker, b: Worker, label: string): () => void {
   };
 }
 
-export async function spawn<
+export function spawn<
   T,
   const C extends readonly Codec<unknown>[] = readonly Codec<unknown>[],
 >(
-  worker: Worker,
+  source: Worker | Transport,
   options: SpawnOptions<C> = {},
+): Promise<Remote<T, CodecValueTypes<C>> & ActorHandle> {
+  // Worker is the structured-clone message-port world: convert it to a
+  // messageport-type Transport and recurse on the unified abstraction. The raw
+  // Worker is kept alongside for crash detection and terminate() (the Transport
+  // abstraction has no worker error event or termination primitive).
+  if (source instanceof Worker) {
+    const rawWorker = source;
+    return spawnOnTransport<T, C>(
+      fromMessagePort(rawWorker as unknown as MessagePort),
+      options,
+      rawWorker,
+    );
+  }
+  return spawnOnTransport<T, C>(source, options);
+}
+
+async function spawnOnTransport<
+  T,
+  const C extends readonly Codec<unknown>[] = readonly Codec<unknown>[],
+>(
+  worker: Transport,
+  options: SpawnOptions<C> = {},
+  rawWorker?: Worker,
 ): Promise<Remote<T, CodecValueTypes<C>> & ActorHandle> {
   // Constraint: the worker handshake is not buffered — call spawn() right after
   // `new Worker(...)`. If messages arrive before the onmessage handler below is
@@ -303,24 +411,23 @@ export async function spawn<
   // just another adapter, identical to a worker-to-worker link.
   const rpcProxy = createRpcProxy(registry, {
     send: (request, transfer) =>
-      worker.postMessage(
+      worker.send(
         {
           type: "request",
           id: request.id,
           method: request.method,
           args: request.args,
         } satisfies Frame,
-        { transfer },
+        transfer,
       ),
     isDead: () => dead,
+    transport: worker,
   });
-  // Assign a stable worker id (embedded in refIds) and register it for acquire
-  // routing. The id is sent after the handshake so the worker is definitely
-  // ready; FIFO ordering on the channel guarantees it arrives before any
-  // user request.
-  const workerId = `w${nextWorkerId++}`;
-  workersById.set(workerId, worker);
-  workerIdByWorker.set(worker, workerId);
+  // Assign a stable transport id (embedded in refIds) and register it for
+  // acquire routing. The id is sent after the handshake so the worker is
+  // definitely ready; FIFO ordering on the channel guarantees it arrives
+  // before any user request.
+  const workerId = actorRegistry.register(worker);
   let dead = false;
   let resolveHandshake: (() => void) | undefined;
   let rejectHandshake: ((reason: unknown) => void) | undefined;
@@ -331,8 +438,10 @@ export async function spawn<
     rejectHandshake = reject;
   });
 
-  worker.onmessage = (ev: MessageEvent<Frame>) => {
-    const frame = ev.data;
+  // Transport onMessage delivers { data, ports } wrappers (MessageEvent-like),
+  // carrying any transferred MessagePorts (e.g. reference-acquire handshakes).
+  worker.onMessage((ev) => {
+    const frame = ev.data as Frame;
     if (frame.type === "handshake") {
       if (frame.version !== PROTOCOL_VERSION) {
         kill(
@@ -358,8 +467,19 @@ export async function spawn<
         );
         return;
       }
+      // Transport-kind mismatch: a Mux transport must not be treated as a
+      // messageport one (no MessagePort transfer across Mux). A peer that
+      // doesn't send kind (older protocol) is accepted as messageport.
+      if (frame.kind !== undefined && frame.kind !== worker.kind) {
+        kill(
+          new Error(
+            `Transport kind mismatch: worker speaks ${frame.kind}, host transport is ${worker.kind}`,
+          ),
+        );
+        return;
+      }
       // Tell the worker its id (for refIds); FIFO after the handshake.
-      worker.postMessage({ type: "__worker-id", id: workerId } satisfies Frame);
+      worker.send({ type: "__worker-id", id: workerId } satisfies Frame);
       resolveHandshake?.();
       return;
     }
@@ -376,16 +496,22 @@ export async function spawn<
     // Remaining worker→main control frames (e.g. __holder-dead death notices
     // from the liveness sweep) go to registered codec control handlers.
     dispatchControlFrame(frame as ControlFrame);
-  };
+  });
 
-  worker.onerror = (ev) =>
-    kill(
-      new Error(
-        `Worker crashed: ${ev.message}`,
-        { cause: ev.error },
-      ),
-    );
-  worker.onmessageerror = () => kill(new Error("Worker deserialization error"));
+  // Worker crash detection: only the raw Worker path has error events.
+  // Mux transports surface death through closed channels (wired via onDeath /
+  // onClose at the caller, e.g. spawnProcess).
+  if (rawWorker) {
+    rawWorker.onerror = (ev) =>
+      kill(
+        new Error(
+          `Worker crashed: ${ev.message}`,
+          { cause: ev.error },
+        ),
+      );
+    rawWorker.onmessageerror = () =>
+      kill(new Error("Worker deserialization error"));
+  }
 
   function kill(reason: unknown): void {
     if (dead) return;
@@ -395,10 +521,11 @@ export async function spawn<
     // If the handshake hasn't finished yet (version/codec mismatch, worker crash),
     // reject it so spawn() fails instead of hanging.
     rejectHandshake?.(reason);
-    worker.terminate();
+    // A real Worker is terminated; other transports are closed.
+    if (rawWorker) rawWorker.terminate();
+    else worker.close();
     // A dead worker can no longer serve references: drop it from acquire routing.
-    workersById.delete(workerId);
-    workerIdByWorker.delete(worker);
+    actorRegistry.unregister(workerId);
     // Notify the owner (e.g. an actor pool) so it can remove/replace the member.
     // Deliberately NOT fired by dispose(): a deliberate shutdown is not a death.
     options.onDeath?.(reason);
@@ -414,9 +541,10 @@ export async function spawn<
     dead = true;
     registry.failAll();
     try {
-      worker.postMessage({ type: "dispose" } satisfies Frame);
+      worker.send({ type: "dispose" } satisfies Frame);
     } finally {
-      worker.terminate();
+      if (rawWorker) rawWorker.terminate();
+      else worker.close();
     }
     rpcProxy.rejectAll(new ActorDiedError());
     return Promise.resolve();
@@ -475,4 +603,353 @@ export async function spawn<
   // the exact registered function.
   interrupt?.removeEventListener("abort", onInterruptAbort);
   return actor;
+}
+
+export interface SpawnProcessOptions<
+  C extends readonly Codec<unknown>[] = readonly Codec<unknown>[],
+> {
+  /** Extra codecs, matched before the built-ins (same semantics as SpawnOptions.codecs). */
+  codecs?: C;
+  /** Creation interruption (same semantics as SpawnOptions.signal). */
+  signal?: AbortSignal | null;
+  /** Fired when the process actor dies (crash / handshake failure; not dispose). */
+  onDeath?: (reason: unknown) => void;
+  /**
+   * Deno permissions granted to the child process (passed to Deno.Command's
+   * `permissions` option). The caller controls exactly what the actor process
+   * can access. Omit for an allow-everything (-A) child.
+   */
+  permissions?: Deno.PermissionOptionsObject;
+  /** Extra CLI args passed to the child `deno run` invocation (e.g. unstable flags). */
+  denoArgs?: string[];
+}
+
+/**
+ * Spawn an actor in a separate Deno process. The child runs the module at
+ * `entrypoint` which must call serveProcess(rpc) at top level. Communication
+ * uses node:child_process fork IPC (serialization 'advanced') — a dedicated
+ * out-of-band channel that child stdout/stderr logging cannot pollute.
+ *
+ * The child's Deno permissions are controlled via `permissions`; the RPC
+ * surface type is derived from `typeof module.rpc` on the child module.
+ *
+ *   // child.ts
+ *   import { serveProcess } from ".../worker_runtime.ts";
+ *   export const rpc = { add(a: number, b: number) { return a + b; } };
+ *   serveProcess(rpc);
+ *
+ *   // main.ts
+ *   import type * as ChildModule from "./child.ts";
+ *   const actor = await spawnProcess<typeof ChildModule.rpc>("./child.ts", {
+ *     permissions: { read: true },
+ *   });
+ *   await actor.add(1, 2);
+ */
+export async function spawnProcess<
+  T,
+  const C extends readonly Codec<unknown>[] = readonly Codec<unknown>[],
+>(
+  entrypoint: string,
+  options: SpawnProcessOptions<C> = {},
+): Promise<Remote<T, CodecValueTypes<C>> & ActorHandle> {
+  // Dynamic import keeps node:child_process out of the worker/module graph for
+  // paths that never spawn processes.
+  const { spawn: cpSpawn } = await import("node:child_process");
+  const args = ["run", ...permissionArgs(options.permissions), entrypoint];
+  if (options.denoArgs) args.splice(1, 0, ...options.denoArgs);
+  // stdio 'ipc' opens the dedicated IPC channel (fd 3 on the child); the
+  // channel is v8-message-based (serialization 'advanced').
+  const child = cpSpawn(
+    Deno.execPath(),
+    args,
+    {
+      stdio: ["ipc", "pipe", "pipe"],
+      serialization: "advanced",
+    } as never,
+  );
+  let dead = false;
+  let disposed = false;
+  // Assigned once spawn() resolves; kill() may run before that (no actor yet).
+  const actorRef: { current?: Remote<T, CodecValueTypes<C>> & ActorHandle } =
+    {};
+  function kill(reason: unknown): void {
+    if (dead) return;
+    dead = true;
+    options.onDeath?.(reason);
+    // Tear down the inner actor so in-flight calls reject (not just the child).
+    if (actorRef.current) void actorRef.current.dispose();
+    try {
+      child.kill();
+    } catch {
+      // already exited
+    }
+  }
+  const transport = fromNodeIpc(
+    (message) => {
+      try {
+        return child.send(message as never);
+      } catch {
+        return false;
+      }
+    },
+    {
+      onClosed: () => {
+        // The child's IPC channel closed (process exit / crash). A deliberate
+        // dispose already terminated the child — don't report it as a death.
+        if (!dead && !disposed) {
+          kill(new Error("Actor process exited unexpectedly"));
+        }
+      },
+    },
+  );
+  child.on("message", (message) => transport.deliver(message));
+  child.on("error", (err) => {
+    if (!dead && !disposed) kill(err);
+  });
+
+  // Build the actor on the IPC transport; onDeath wires process death to kill.
+  const actor = await spawn<T, C>(transport, {
+    codecs: options.codecs,
+    signal: options.signal,
+    onDeath: (reason: unknown) => kill(reason),
+  });
+  actorRef.current = actor;
+  const innerDispose = actor.dispose.bind(actor);
+  actor.dispose = (): Promise<void> => {
+    disposed = true;
+    return innerDispose();
+  };
+  return actor;
+}
+
+/** Map a Deno PermissionOptionsObject to `--allow-*` CLI flags for the child. */
+function permissionArgs(permissions?: Deno.PermissionOptionsObject): string[] {
+  if (!permissions) return ["--allow-all"];
+  const out: string[] = [];
+  const kinds: (keyof Deno.PermissionOptionsObject)[] = [
+    "read",
+    "write",
+    "net",
+    "env",
+    "run",
+    "sys",
+    "ffi",
+  ];
+  for (const kind of kinds) {
+    const value = permissions[kind];
+    if (value === true) out.push(`--allow-${kind}`);
+    else if (typeof value === "string" || Array.isArray(value)) {
+      const list = Array.isArray(value) ? value : [value];
+      out.push(`--allow-${kind}=${list.join(",")}`);
+    }
+    // undefined / false: deny (no flag)
+  }
+  return out;
+}
+
+export interface SpawnNodeOptions {
+  /** Creation interruption (same semantics as SpawnOptions.signal). */
+  signal?: AbortSignal | null;
+  /** Fired when the node process dies (crash / handshake failure; not dispose). */
+  onDeath?: (reason: unknown) => void;
+  /** Deno permissions granted to the child node process. */
+  permissions?: Deno.PermissionOptionsObject;
+  /** Extra CLI args for the child `deno run` invocation. */
+  denoArgs?: string[];
+}
+
+export type SpawnedNode<T extends Record<string, object>> =
+  & {
+    [K in keyof T]: Remote<T[K]>;
+  }
+  & {
+    dispose(): Promise<void>;
+    /**
+     * The node's underlying transport: open additional actor channels directly
+     * via connectActor / openNodeActor, and route reference-acquire frames.
+     */
+    readonly transport: Transport;
+    /** Registry entry for this node connection (refIds of refs its actors own). */
+    readonly registryId: string;
+    /** The coordinator registry (transport id → Transport) for advanced routing. */
+    getRegistry(): ActorRegistry;
+  };
+
+/**
+ * Spawn a multi-actor node process (model B): the child module calls
+ * serveNode(actors) and announces its actor names; this returns a
+ * { [name]: Remote } surface where each actor runs on its own logical
+ * channel over the fork IPC connection.
+ *
+ *   // node.ts
+ *   import { serveNode } from ".../worker_runtime.ts";
+ *   export const actors = { counter: { inc(n) { return n + 1; } } };
+ *   serveNode(actors);
+ *
+ *   // main.ts
+ *   import type * as NodeModule from "./node.ts";
+ *   const node = await spawnNode<typeof NodeModule.actors>("./node.ts");
+ *   await node.counter.inc(1);
+ *   await node.dispose();
+ */
+export async function spawnNode<
+  T extends Record<string, object>,
+>(
+  entrypoint: string,
+  options: SpawnNodeOptions = {},
+): Promise<SpawnedNode<T>> {
+  const { spawn: cpSpawn } = await import("node:child_process");
+  const args = ["run", ...permissionArgs(options.permissions), entrypoint];
+  if (options.denoArgs) args.splice(1, 0, ...options.denoArgs);
+  const child = cpSpawn(
+    Deno.execPath(),
+    args,
+    {
+      stdio: ["ipc", "pipe", "pipe"],
+      serialization: "advanced",
+    } as never,
+  );
+
+  let dead = false;
+  let disposed = false;
+  const rpcProxies: RpcProxy[] = [];
+  function kill(reason: unknown): void {
+    if (dead) return;
+    dead = true;
+    options.onDeath?.(reason);
+    // Reject every actor channel's in-flight calls so callers don't hang.
+    for (const proxy of rpcProxies) proxy.rejectAll(reason);
+    try {
+      child.kill();
+    } catch {
+      // already exited
+    }
+  }
+
+  const transport = fromNodeIpc(
+    (message) => {
+      try {
+        return child.send(message as never);
+      } catch {
+        return false;
+      }
+    },
+    {
+      onClosed: () => {
+        if (!dead && !disposed) kill(new Error("Node process exited"));
+      },
+    },
+  );
+  child.on("message", (message) => transport.deliver(message));
+  child.on("error", (err) => !dead && !disposed && kill(err));
+  // Register the node connection for acquire routing: refs owned by any of
+  // its actors carry this transport's id, and the registry resolves it to the
+  // node transport. The registration must survive onClosed (a process that
+  // merely closed its connection is still routable via a re-connection), so it
+  // is not tied to unregister.
+  const registryId = actorRegistry.register(transport);
+
+  // Handshake: the node announces its actor names. Failures kill the child.
+  const actors = await new Promise<string[]>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      kill(new Error("Node handshake timed out"));
+      reject(new Error("Node handshake timed out"));
+    }, 10_000);
+    transport.onMessage((ev) => {
+      const frame = ev.data as { type?: string; actors?: string[] };
+      if (frame.type === "handshake") {
+        clearTimeout(timeout);
+        resolve(frame.actors ?? []);
+      }
+    });
+    child.on("error", (err) => {
+      clearTimeout(timeout);
+      reject(err);
+    });
+    child.on("exit", () => {
+      clearTimeout(timeout);
+      reject(new Error("Node exited before handshake"));
+    });
+  });
+
+  // Open one channel per actor; each runs standard RPC frames over it.
+  const registry = new PayloadCodecRegistry();
+  for (
+    const codec of [iterableCodec, errorCodec, abortSignalCodec, callbackCodec]
+  ) {
+    if (!registry.has(codec.tag)) registry.register(codec);
+  }
+  const surface = {} as Record<string, unknown>;
+  for (const name of actors) {
+    const opened = transport.openChannel();
+    // Tell the node which actor this channel serves: the open token rides as
+    // a Mux control frame (the node's Mux opens the channel + acks), and the
+    // __open-actor frame names it. Both go on the main channel in order.
+    transport.send(opened.token);
+    transport.send({
+      type: "__open-actor",
+      name,
+      token: opened.token,
+    } as unknown as Frame);
+    const channel = opened.channel;
+    const proxy = createRpcProxy(registry, {
+      send: (request, transfer) =>
+        channel.send(
+          {
+            type: "request",
+            id: request.id,
+            method: request.method,
+            args: request.args,
+          } satisfies Frame,
+          transfer,
+        ),
+      isDead: () => channel.closed,
+      deadReason: () => new Error(`Actor "${name}" channel closed`),
+      transport,
+    });
+    rpcProxies.push(proxy);
+    channel.onMessage((message) => {
+      const frame = message as Frame;
+      if (frame.type === "response") proxy.deliver(frame);
+    });
+    surface[name] = new Proxy({} as object, {
+      get(_t, prop) {
+        if (prop === "then") return undefined;
+        if (typeof prop === "string") {
+          return (...args: unknown[]) => {
+            const p = proxy.call(prop, args);
+            attachLazyIterator(p);
+            return p;
+          };
+        }
+        return undefined;
+      },
+    });
+  }
+
+  const dispose = (): Promise<void> => {
+    if (dead) return Promise.resolve();
+    disposed = true;
+    dead = true;
+    try {
+      transport.send({ type: "dispose" } satisfies Frame);
+    } finally {
+      transport.close();
+      // Deliberate shutdown: not a death — reject in-flight, don't fire onDeath.
+      for (const proxy of rpcProxies) proxy.rejectAll(new ActorDiedError());
+      try {
+        child.kill();
+      } catch {
+        // already exited
+      }
+    }
+    return Promise.resolve();
+  };
+
+  return Object.assign(surface, {
+    dispose,
+    transport,
+    registryId,
+    getRegistry: () => actorRegistry,
+  }) as never;
 }
