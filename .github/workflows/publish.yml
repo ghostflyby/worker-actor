@@ -18,7 +18,8 @@ jobs:
           deno-version: "2.x"
 
       - name: Run tests
-        run: deno test --allow-read
+        # Same permissions as CI: process/node/websocket/mixed tests need them.
+        run: deno test --allow-read --allow-run --allow-env --allow-net
 
       - name: Verify tag == version
         run: |
