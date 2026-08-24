@@ -130,9 +130,18 @@ const HANDSHAKE_TIMEOUT = 10_000;
 // (embedded in refIds as a prefix), so the coordinator can resolve
 // "refId → owner transport" and bootstrap an owner↔requester channel on
 // demand. This is the pluggable ActorRegistry — the minimal discovery layer.
-import { createActorRegistry } from "./core/registry.ts";
+import { type ActorRegistry, createActorRegistry } from "./core/registry.ts";
 
 const actorRegistry = createActorRegistry();
+
+/**
+ * The coordinator's actor registry (exported for diagnostics / advanced
+ * routing). The registry resolves "transport id → Transport", which is how
+ * acquire frames and cross-connection connects route to the right peer.
+ */
+export function getActorRegistry(): ActorRegistry {
+  return actorRegistry;
+}
 // Established (owner, holder) pairs: the liveness channel is created once per
 // pair, on the first serve; later serves reuse it on both sides.
 const livenessPairs = new Set<string>();
@@ -143,6 +152,39 @@ function routeAcquire(refId: string, requester: Transport): void {
   const owner = actorRegistry.resolve(ownerId);
   if (!owner) return; // unknown or dead owner: nothing to bootstrap
   const requesterId = actorRegistry.idOf(requester);
+  if (owner.kind !== "messageport" || requester.kind !== "messageport") {
+    // Mux involved: MessagePorts cannot be transferred over a Mux connection.
+    // Bootstrap one Mux channel on the owner's transport (served by the owner)
+    // and another on the requester's transport (holding the proxy), then relay
+    // frames between the two channel ends here on the main thread. The liveness
+    // plane is messageport-only (per-holder pair channels); Mux acquires skip
+    // it — see the remote-ref codec docs.
+    const ownerEnd = owner.openChannel();
+    const requesterEnd = requester.openChannel();
+    // Bridge first so no frame is dropped: owner calls/results and the requester
+    // proxy's calls/results flow through the relay, both directions.
+    ownerEnd.channel.onMessage((m) => requesterEnd.channel.send(m));
+    requesterEnd.channel.onMessage((m) => ownerEnd.channel.send(m));
+    owner.send(ownerEnd.token);
+    owner.send(
+      {
+        type: "__serve-ref",
+        refId,
+        token: ownerEnd.token,
+        holderId: requesterId,
+      } satisfies Frame,
+    );
+    requester.send(requesterEnd.token);
+    requester.send(
+      {
+        type: "__ref-acquired",
+        refId,
+        token: requesterEnd.token,
+        ownerId,
+      } satisfies Frame,
+    );
+    return;
+  }
   const { port1, port2 } = new MessageChannel();
   const transfer1: Transferable[] = [port1];
   const transfer2: Transferable[] = [port2];
@@ -188,6 +230,22 @@ function routeAcquireMain(refId: string): void {
   const ownerId = refId.slice(0, refId.indexOf(":"));
   const owner = actorRegistry.resolve(ownerId);
   if (!owner) return;
+  if (owner.kind !== "messageport") {
+    // Mux owner: open a channel on the owner's transport and materialize the
+    // main-side pending using the LOCAL channel end directly (no relay needed —
+    // the main thread owns one end and the owner serves the other).
+    const opened = owner.openChannel();
+    owner.send(opened.token);
+    owner.send(
+      { type: "__serve-ref", refId, token: opened.token } satisfies Frame,
+    );
+    dispatchControlFrame({
+      type: "__ref-acquired",
+      refId,
+      channel: opened.channel,
+    });
+    return;
+  }
   const { port1, port2 } = new MessageChannel();
   owner.send(
     { type: "__serve-ref", refId, port: port1 } satisfies Frame,
@@ -671,6 +729,23 @@ export interface SpawnNodeOptions {
   denoArgs?: string[];
 }
 
+export type SpawnedNode<T extends Record<string, object>> =
+  & {
+    [K in keyof T]: Remote<T[K]>;
+  }
+  & {
+    dispose(): Promise<void>;
+    /**
+     * The node's underlying transport: open additional actor channels directly
+     * via connectActor / openNodeActor, and route reference-acquire frames.
+     */
+    readonly transport: Transport;
+    /** Registry entry for this node connection (refIds of refs its actors own). */
+    readonly registryId: string;
+    /** The coordinator registry (transport id → Transport) for advanced routing. */
+    getRegistry(): ActorRegistry;
+  };
+
 /**
  * Spawn a multi-actor node process (model B): the child module calls
  * serveNode(actors) and announces its actor names; this returns a
@@ -693,7 +768,7 @@ export async function spawnNode<
 >(
   entrypoint: string,
   options: SpawnNodeOptions = {},
-): Promise<{ [K in keyof T]: Remote<T[K]> } & { dispose(): Promise<void> }> {
+): Promise<SpawnedNode<T>> {
   const { spawn: cpSpawn } = await import("node:child_process");
   const args = ["run", ...permissionArgs(options.permissions), entrypoint];
   if (options.denoArgs) args.splice(1, 0, ...options.denoArgs);
@@ -738,6 +813,12 @@ export async function spawnNode<
   );
   child.on("message", (message) => transport.deliver(message));
   child.on("error", (err) => !dead && !disposed && kill(err));
+  // Register the node connection for acquire routing: refs owned by any of
+  // its actors carry this transport's id, and the registry resolves it to the
+  // node transport. The registration must survive onClosed (a process that
+  // merely closed its connection is still routable via a re-connection), so it
+  // is not tied to unregister.
+  const registryId = actorRegistry.register(transport);
 
   // Handshake: the node announces its actor names. Failures kill the child.
   const actors = await new Promise<string[]>((resolve, reject) => {
@@ -836,5 +917,10 @@ export async function spawnNode<
     return Promise.resolve();
   };
 
-  return Object.assign(surface, { dispose }) as never;
+  return Object.assign(surface, {
+    dispose,
+    transport,
+    registryId,
+    getRegistry: () => actorRegistry,
+  }) as never;
 }

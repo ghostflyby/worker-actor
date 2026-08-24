@@ -17,10 +17,11 @@
  *   protocol/   — wire protocol details
  */
 export { attachLazyIterator, link, spawn } from "./spawn.ts";
-export { spawnNode, spawnProcess } from "./spawn.ts";
+export { getActorRegistry, spawnNode, spawnProcess } from "./spawn.ts";
 export type {
   ActorHandle,
   Remote,
+  SpawnedNode,
   SpawnNodeOptions,
   SpawnOptions,
   SpawnProcessOptions,
@@ -33,6 +34,8 @@ export type {
   ServeWorkerOptions,
   WorkerApi,
 } from "./worker_runtime.ts";
+export { connectActor, openNodeActor } from "./core/connect.ts";
+export type { ConnectedActor } from "./core/connect.ts";
 export {
   fromMessagePort,
   fromNodeIpc,

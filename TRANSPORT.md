@@ -257,33 +257,35 @@ export function createDecoder(): TransformStream<Uint8Array, unknown>; // 解帧
 - **TCP 适配器明确不做**（WebSocket 取代；TCP 仅作为底层可选，用户侧自行桥接）。
 - 引导层（地址注册/发现：谁在哪、如何回连）❌ 未做。
 - acquire / ref / iterable 跨连接（令牌化已就绪）：iterable / abort-signal /
-  callback 已跨进程；**remote-ref 仍 messageport-only** ❌。
+  callback / remote-ref 新鲜令牌已跨进程；**remote-ref 的 refId 间接共享
+  （refId-only 转发 + acquire 引导通道）尚未跨进程端到端验证** ❌。
 - 验证：本机 WS 端到端 ✅；多机 ❌。
 
-### Phase 4 — 握手与协议版本 ❌ 未做
+### Phase 4 — 握手与协议版本 ✅ 已完成
 
-- 握手帧增加传输能力字段（`kind` / `canTransfer` / 帧类型），`PROTOCOL_VERSION`
-  bump，避免新旧混跑时把"无 transfer 的通道"当成有 transfer 的用。
+- 握手帧已携带传输能力字段（`kind`: "messageport" / "framed" / "message"），
+  spawn 对两端 kind 做一致性校验（Mux 传输不得被当作 messageport 使用）。
+  `PROTOCOL_VERSION` 暂未 bump（kind 字段向后兼容缺失方，视为 messageport）。
 
 ## 8. 需要改动的文件清单
 
-| 文件                                              | 改动                                                                           | 阶段     |
-| ------------------------------------------------- | ------------------------------------------------------------------------------ | -------- |
-| `core/transport.ts`（新）                         | `Transport` 接口（`openChannel`/`onChannel`）+ 适配器                          | ✅ P1    |
-| `core/frame.ts`（新）                             | `createEncoder`/`createDecoder`（TransformStream）+ Mux                        | ✅ P1    |
-| `core/channel.ts`                                 | `Channel.kind` 标注；`port` 可选；`openChannel` 改走 transport；`connectToken` | ✅ P1    |
-| `core/codec.ts`                                   | `EncodeContext`/`DecodeContext` 暴露 `transport`；token 语义                   | ✅ P1    |
-| `spawn.ts`                                        | `spawn` 泛化（Worker \| Transport）+ `spawnProcess` + `spawnNode`              | ✅ P2    |
-| `worker_runtime.ts`                               | `createRuntime` 共享 + `serveProcess` + `serveNode`                            | ✅ P2    |
-| `core/stream.ts` + iterable/abort/callback codecs | 通道令牌化（per-value 通道改为令牌 + 按需建立）                                | ✅ P2/P3 |
-| `mod.ts` / `codec.ts`                             | 公共导出（spawn 泛化 + Transport 适配器 + serveNode 等）                       | ✅ P3    |
-| `examples/remote_ref/ref_codec.ts`                | remote-ref 令牌化（跨进程）                                                    | ❌ 待做  |
-| `core/worker-context.ts`                          | `triggerAcquire` 传输侧判定                                                    | ❌ 待做  |
-| `pool.ts`                                         | 工厂类型放宽 / `createProcessPool`                                             | ❌ 待做  |
-| 引导层（新）                                      | 地址注册/发现（谁在哪、如何回连）                                              | ❌ 待做  |
-| `core/protocol.ts`                                | 握手传输能力字段；版本 bump                                                    | ❌ 待做  |
-| 示例                                              | 进程版 calculator / 混合拓扑                                                   | ❌ 待做  |
-| `DESIGN.md`                                       | 传输章节重写为本文第 3–6 节口径                                                | ❌ 待做  |
+| 文件                                              | 改动                                                                           | 阶段                            |
+| ------------------------------------------------- | ------------------------------------------------------------------------------ | ------------------------------- |
+| `core/transport.ts`（新）                         | `Transport` 接口（`openChannel`/`onChannel`）+ 适配器                          | ✅ P1                           |
+| `core/frame.ts`（新）                             | `createEncoder`/`createDecoder`（TransformStream）+ Mux                        | ✅ P1                           |
+| `core/channel.ts`                                 | `Channel.kind` 标注；`port` 可选；`openChannel` 改走 transport；`connectToken` | ✅ P1                           |
+| `core/codec.ts`                                   | `EncodeContext`/`DecodeContext` 暴露 `transport`；token 语义                   | ✅ P1                           |
+| `spawn.ts`                                        | `spawn` 泛化（Worker \| Transport）+ `spawnProcess` + `spawnNode`              | ✅ P2                           |
+| `worker_runtime.ts`                               | `createRuntime` 共享 + `serveProcess` + `serveNode`                            | ✅ P2                           |
+| `core/stream.ts` + iterable/abort/callback codecs | 通道令牌化（per-value 通道改为令牌 + 按需建立）                                | ✅ P2/P3                        |
+| `mod.ts` / `codec.ts`                             | 公共导出（spawn 泛化 + Transport 适配器 + serveNode 等）                       | ✅ P3                           |
+| `examples/remote_ref/ref_codec.ts`                | remote-ref 令牌化（跨进程）                                                    | ✅ P3                           |
+| `core/worker-context.ts`                          | `triggerAcquire` 传输侧判定                                                    | ✅ P3                           |
+| `pool.ts`                                         | 工厂类型放宽（`Worker \| Transport`）/ `createProcessPool`                     | ✅ P3 / ❌ 待做                 |
+| 引导层（新）                                      | 地址注册/发现（谁在哪、如何回连）                                              | ❌ 待做                         |
+| `core/protocol.ts`                                | 握手传输能力字段；版本 bump                                                    | ✅ P4（kind 字段；版本未 bump） |
+| 示例                                              | 进程版 calculator / 混合拓扑                                                   | ✅ P2 进程示例 / ❌ 混合拓扑    |
+| `DESIGN.md`                                       | 传输章节重写为本文第 3–6 节口径                                                | ✅ 已同步                       |
 
 ## 9. 兼容性与风险
 
@@ -309,4 +311,4 @@ export function createDecoder(): TransformStream<Uint8Array, unknown>; // 解帧
 - 字节流通道上 callback 的按需连接实现（callback 是轻量单向通道，令牌化成本）。
 - 混合拓扑（一端 Worker、一端进程、一端远端）的 ref 恢复语义是否一致
   （应一致——通道身份已令牌化，owner 只认 refId）。
-- WebSocket 适配器分帧形态确认：长度前缀（默认，批处理友好）vs 一帧一消息。
+- remote-ref 的 refId 间接共享（refId-only 转发）跨进程验证（token 引导通道）。

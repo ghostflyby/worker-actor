@@ -65,23 +65,29 @@ export type Frame =
   | { type: "__worker-id"; id: string }
   /** Worker → main: request a channel to the owner of a reference (refId embeds the owner id). */
   | { type: "__acquire-ref"; refId: string }
-  /** Main → owner: serve this reference's object over the given fresh port (per-holder channel).
-   *  holderId is the requester's worker id (for per-holder liveness); livenessPort is the
-   *  owner end of the one liveness channel per (owner, holder) pair, sent on the first serve only. */
+  /** Main → owner: serve this reference's object over the given channel (per-holder channel).
+   *  On a messageport transport the channel is a transferred `port`; on a Mux transport it is
+   *  a `token` ({ __mux: "open", ch }) the owner resolves via connectToken.
+   *  holderId is the requester's transport id (for per-holder liveness); livenessPort is the
+   *  owner end of the one liveness channel per (owner, holder) pair, sent on the first serve
+   *  only — the messageport world only (Mux skips the liveness plane). */
   | {
     type: "__serve-ref";
     refId: string;
-    port: MessagePort;
+    port?: MessagePort;
+    token?: unknown;
     holderId?: string;
     livenessPort?: MessagePort;
   }
   /** Main → requester: here is the acquired channel; materialize the proxy.
-   *  ownerId is the owner's worker id; livenessPort is the requester end of the pair
-   *  liveness channel (first acquire only). */
+   *  Same port/token shape as __serve-ref. ownerId is the owner's transport id;
+   *  livenessPort is the requester end of the pair liveness channel (first acquire
+   *  only, messageport world only). */
   | {
     type: "__ref-acquired";
     refId: string;
-    port: MessagePort;
+    port?: MessagePort;
+    token?: unknown;
     ownerId?: string;
     livenessPort?: MessagePort;
   }

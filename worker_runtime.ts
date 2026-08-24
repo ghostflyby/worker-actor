@@ -37,6 +37,7 @@ import {
 import {
   dispatchControlFrame,
   setActiveRegistry,
+  setActiveTransport,
   setWorkerId,
 } from "./core/worker-context.ts";
 import {
@@ -150,6 +151,9 @@ function createRuntime(
   }
   const links = new Map<string, Channel>();
   setActiveRegistry(registry);
+  // Acquire control frames must ride this runtime's own transport (a process
+  // actor has no self.postMessage for the __acquire-ref request).
+  setActiveTransport(transport);
   const mainHandler = makeRpcHandler(api, registry, transport);
 
   transport.onMessage(async (ev) => {
@@ -408,6 +412,10 @@ export function serveNode(
       return t;
     })()
     : fromMessagePort(self as unknown as MessagePort);
+
+  // Node actors also post acquire frames on the node's own transport (a
+  // node process has no self.postMessage for the __acquire-ref request).
+  setActiveTransport(transport);
 
   const names = Object.keys(rpcs);
   const actorChannels = new Set<Channel>();

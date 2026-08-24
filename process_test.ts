@@ -1,5 +1,6 @@
 import { assertEquals } from "@std/assert";
 import type * as ProcessWorker from "./test_fixtures/process_worker.ts";
+import type * as RefProcessWorker from "./test_fixtures/ref_process_worker.ts";
 import { spawnProcess } from "./spawn.ts";
 
 // The process fixture serves remote-ref codec; every spawn must register it
@@ -158,3 +159,86 @@ Deno.test("spawnProcess: abort still works after a stream was consumed (channel 
     await actor.dispose();
   }
 });
+
+interface CounterRef {
+  inc(): Promise<number>;
+  get(): Promise<number>;
+}
+
+Deno.test(
+  "ref acquire: a process actor's ref handed to ANOTHER process actor acquires over Mux",
+  async () => {
+    // Owner A and holder B are separate Deno processes (Mux transports). Main
+    // gets a fresh ref from A, B holds it, B's first call triggers the acquire:
+    // the refId-only hand-off must bootstrap a per-holder Mux channel on A's
+    // transport and complete (no MessagePort, no hang).
+    const ownerA = await spawnProcess<typeof RefProcessWorker.rpc>(
+      "./test_fixtures/ref_process_worker.ts",
+      { codecs: REF_CODEC },
+    );
+    const holderB = await spawnProcess<typeof RefProcessWorker.rpc>(
+      "./test_fixtures/ref_process_worker.ts",
+      { codecs: REF_CODEC },
+    );
+    try {
+      const refFromA = await ownerA
+        .getCounter() as unknown as import("./examples/remote_ref/ref_codec.ts").RemoteRef<
+          CounterRef
+        >;
+      assertEquals(await refFromA.inc(), 1); // fresh token works across processes
+      await holderB.holdRef(refFromA);
+      // B's call is the refId-only acquire: routed by the main thread over
+      // Mux channels, served by A, materialized in B.
+      const outcome = await Promise.race([
+        holderB.callHeld().then(
+          (n) => `ok:${n}` as const,
+          (e: unknown) => e,
+        ),
+        new Promise((r) => setTimeout(() => r("TIMEOUT"), 5_000)),
+      ]);
+      assertEquals(outcome, "ok:2");
+      // The same shared counter: a second call reaches the same object in A.
+      assertEquals(await holderB.callHeld(), 3);
+      // A's own fresh ref still works after the hand-off.
+      assertEquals(await refFromA.inc(), 4);
+    } finally {
+      await ownerA.dispose();
+      await holderB.dispose();
+    }
+  },
+);
+
+Deno.test(
+  "ref acquire: a process actor hands a ref to main (main-side Mux acquire)",
+  async () => {
+    // The owner is a process; the requester is the main thread. The acquire is
+    // routed directly on main (open a Mux channel on the owner's transport and
+    // serve it there), so the pending proxy must materialize with the local
+    // channel end and complete without hanging.
+    const ownerA = await spawnProcess<typeof RefProcessWorker.rpc>(
+      "./test_fixtures/ref_process_worker.ts",
+      { codecs: REF_CODEC },
+    );
+    try {
+      const refFromA = await ownerA
+        .getCounter() as unknown as import("./examples/remote_ref/ref_codec.ts").RemoteRef<
+          CounterRef
+        >;
+      // Hand the proxy (refId-only) back into the owner — it restores to a
+      // local call-through reference on A (no channel involved on A's side).
+      const accept = await ownerA.holdRef(refFromA);
+      assertEquals(accept, "held");
+      // Main acquires: ownerA's Mux transport, main-side materialization.
+      const outcome = await Promise.race([
+        refFromA.inc().then(
+          (n) => `ok:${n}` as const,
+          (e: unknown) => e,
+        ),
+        new Promise((r) => setTimeout(() => r("TIMEOUT"), 5_000)),
+      ]);
+      assertEquals(outcome, "ok:1");
+    } finally {
+      await ownerA.dispose();
+    }
+  },
+);
