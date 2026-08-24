@@ -29,6 +29,7 @@ import { errorCodec } from "./core/codecs/error.ts";
 import { abortSignalCodec } from "./core/codecs/abort_signal.ts";
 import { callbackCodec } from "./core/codecs/callback.ts";
 import { fromMessagePort, type Transport } from "./core/transport.ts";
+import { fromNodeIpc } from "./core/transport.ts";
 
 // The RPC boundary is inherently dynamic: type safety comes from Remote<T>
 // deriving the worker's concrete signatures, and this any only serves shape
@@ -495,4 +496,131 @@ export async function spawn<
   // the exact registered function.
   interrupt?.removeEventListener("abort", onInterruptAbort);
   return actor;
+}
+
+export interface SpawnProcessOptions<
+  C extends readonly Codec<unknown>[] = readonly Codec<unknown>[],
+> {
+  /** Extra codecs, matched before the built-ins (same semantics as SpawnOptions.codecs). */
+  codecs?: C;
+  /** Creation interruption (same semantics as SpawnOptions.signal). */
+  signal?: AbortSignal | null;
+  /** Fired when the process actor dies (crash / handshake failure; not dispose). */
+  onDeath?: (reason: unknown) => void;
+  /**
+   * Deno permissions granted to the child process (passed to Deno.Command's
+   * `permissions` option). The caller controls exactly what the actor process
+   * can access. Omit for an allow-everything (-A) child.
+   */
+  permissions?: Deno.PermissionOptionsObject;
+  /** Extra CLI args passed to the child `deno run` invocation (e.g. unstable flags). */
+  denoArgs?: string[];
+}
+
+/**
+ * Spawn an actor in a separate Deno process. The child runs the module at
+ * `entrypoint` which must call serveProcess(rpc) at top level. Communication
+ * uses node:child_process fork IPC (serialization 'advanced') — a dedicated
+ * out-of-band channel that child stdout/stderr logging cannot pollute.
+ *
+ * The child's Deno permissions are controlled via `permissions`; the RPC
+ * surface type is derived from `typeof module.rpc` on the child module.
+ *
+ *   // child.ts
+ *   import { serveProcess } from ".../worker_runtime.ts";
+ *   export const rpc = { add(a: number, b: number) { return a + b; } };
+ *   serveProcess(rpc);
+ *
+ *   // main.ts
+ *   import type * as ChildModule from "./child.ts";
+ *   const actor = await spawnProcess<typeof ChildModule.rpc>("./child.ts", {
+ *     permissions: { read: true },
+ *   });
+ *   await actor.add(1, 2);
+ */
+export async function spawnProcess<
+  T,
+  const C extends readonly Codec<unknown>[] = readonly Codec<unknown>[],
+>(
+  entrypoint: string,
+  options: SpawnProcessOptions<C> = {},
+): Promise<Remote<T, CodecValueTypes<C>> & ActorHandle> {
+  // Dynamic import keeps node:child_process out of the worker/module graph for
+  // paths that never spawn processes.
+  const { spawn: cpSpawn } = await import("node:child_process");
+  const args = ["run", ...permissionArgs(options.permissions), entrypoint];
+  if (options.denoArgs) args.splice(1, 0, ...options.denoArgs);
+  // stdio 'ipc' opens the dedicated IPC channel (fd 3 on the child); the
+  // channel is v8-message-based (serialization 'advanced').
+  const child = cpSpawn(
+    Deno.execPath(),
+    args,
+    {
+      stdio: ["ipc", "pipe", "pipe"],
+      serialization: "advanced",
+    } as never,
+  );
+  let dead = false;
+  function kill(reason: unknown): void {
+    if (dead) return;
+    dead = true;
+    options.onDeath?.(reason);
+    try {
+      child.kill();
+    } catch {
+      // already exited
+    }
+  }
+  const transport = fromNodeIpc(
+    (message) => {
+      try {
+        return child.send(message as never);
+      } catch {
+        return false;
+      }
+    },
+    {
+      onClosed: () => {
+        // The child's IPC channel closed (process exit / crash).
+        if (!dead) kill(new Error("Actor process exited unexpectedly"));
+      },
+    },
+  );
+  child.on("message", (message) => transport.deliver(message));
+  child.on("error", (err) => {
+    if (!dead) kill(err);
+  });
+
+  // Build the actor on the IPC transport; onDeath wires process death to kill.
+  const actor = await spawn<T, C>(transport, {
+    codecs: options.codecs,
+    signal: options.signal,
+    onDeath: (reason: unknown) => kill(reason),
+  });
+  return actor;
+}
+
+/** Map a Deno PermissionOptionsObject to `--allow-*` CLI flags for the child. */
+function permissionArgs(permissions?: Deno.PermissionOptionsObject): string[] {
+  if (!permissions) return ["--allow-all"];
+  const out: string[] = [];
+  const kinds: (keyof Deno.PermissionOptionsObject)[] = [
+    "read",
+    "write",
+    "net",
+    "env",
+    "run",
+    "sys",
+    "ffi",
+  ];
+  for (const kind of kinds) {
+    const value = permissions[kind];
+    if (value === true) out.push(`--allow-${kind}`);
+    else if (typeof value === "string" || Array.isArray(value)) {
+      const list = Array.isArray(value) ? value : [value];
+      out.push(`--allow-${kind}=${list.join(",")}`);
+    }
+    // undefined / false: deny (no flag)
+  }
+  return out;
 }
