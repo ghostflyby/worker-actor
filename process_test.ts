@@ -146,16 +146,14 @@ Deno.test("spawnProcess: abort still works after a stream was consumed (channel 
     for await (const _ of await actor.count(2)) {
       // drain the stream to trigger its channel close
     }
-    // Then an AbortSignal must still propagate.
+    // Then an AbortSignal must still propagate. The abort fires 50ms in; the
+    // child's spin loop must stop almost immediately (well under 100 iterations).
     const controller = new AbortController();
     const running = actor.spin(5000, controller.signal);
     await new Promise((r) => setTimeout(r, 50));
     controller.abort();
     const iterations = await running;
-    // KNOWN BUG: after a stream is consumed, abort propagation on the same
-    // transport is unreliable (event/state may not reach the child). The
-    // assertion is deliberately loose until the root cause is fixed.
-    assertEquals(iterations < 5000, true);
+    assertEquals(iterations < 100, true);
   } finally {
     await actor.dispose();
   }

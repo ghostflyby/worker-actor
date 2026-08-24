@@ -175,7 +175,13 @@ export function createMux(
   // consumer claimed them (decode-side connectToken runs later). connectToken
   // claims these by id; until then they stay open so data isn't lost.
   const orphaned = new Map<number, MuxChannel>();
-  let nextCh = 1;
+  // Channel ids must be unique ACROSS both ends of the connection: each side
+  // allocates ids independently, and a data frame's ch routes to the peer's
+  // channel table — so an id collision (both sides starting at 1) would
+  // misroute frames. A random base + counter keeps ids unique per side with
+  // negligible collision probability, while remaining a plain number on the
+  // wire.
+  let nextCh = Math.floor(Math.random() * 1_000_000_000) * 1000;
   let handler: ((ev: TransportMessage) => void) | undefined;
   let channelHandler: ((channel: Channel) => void) | undefined;
   let closed = false;
