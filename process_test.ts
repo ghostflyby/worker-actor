@@ -83,7 +83,7 @@ Deno.test("spawnProcess: callbacks cross processes and return results", async ()
     "./test_fixtures/process_worker.ts",
   );
   try {
-    const result = await actor.apply(async (x: number) => x * 2, 21);
+    const result = await actor.apply((x: number) => x * 2, 21);
     assertEquals(result, 42);
   } finally {
     await actor.dispose();

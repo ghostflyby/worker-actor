@@ -69,14 +69,14 @@ Deno.test("WebSocket: RPC round-trip over a message-kind transport", async () =>
     const ws = new WebSocket(`ws://127.0.0.1:${port}`);
     await new Promise<void>((resolve, reject) => {
       ws.onopen = () => resolve();
-      ws.onerror = (e) => reject(new Error("ws connect failed"));
+      ws.onerror = (_e) => reject(new Error("ws connect failed"));
     });
     const clientTransport = fromWebSocket(ws);
     ws.onmessage = (ev) => clientTransport.deliver(ev.data);
 
     const clientRegistry = new PayloadCodecRegistry();
     const proxy = createRpcProxy(clientRegistry, {
-      send: (request, transfer) =>
+      send: (request, _transfer) =>
         clientTransport.send({
           type: "request",
           id: request.id,
