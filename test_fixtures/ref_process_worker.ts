@@ -41,6 +41,12 @@ export const rpc = {
       inc(): Promise<number>;
     }).inc();
   },
+  /** Call a Worker-owned ref's `increment` method (mixed-topology test). */
+  callHeldIncrement(): Promise<number> {
+    return (heldRef as unknown as {
+      increment(): Promise<number>;
+    }).increment();
+  },
 };
 
 serveProcess(rpc, { codecs: [remoteRefCodec] });

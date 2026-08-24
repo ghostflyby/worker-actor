@@ -153,36 +153,65 @@ function routeAcquire(refId: string, requester: Transport): void {
   if (!owner) return; // unknown or dead owner: nothing to bootstrap
   const requesterId = actorRegistry.idOf(requester);
   if (owner.kind !== "messageport" || requester.kind !== "messageport") {
-    // Mux involved: MessagePorts cannot be transferred over a Mux connection.
-    // Bootstrap one Mux channel on the owner's transport (served by the owner)
-    // and another on the requester's transport (holding the proxy), then relay
-    // frames between the two channel ends here on the main thread. The liveness
-    // plane is messageport-only (per-holder pair channels); Mux acquires skip
-    // it — see the remote-ref codec docs.
+    // Mux involved: a MessagePort cannot be transferred over a Mux connection.
+    // Bootstrap one channel end on the owner's transport and another on the
+    // requester's transport, then relay frames between them here on the main
+    // thread. Each side gets its native channel form: a transferred port on a
+    // messageport transport, a Mux token otherwise. The liveness plane is
+    // messageport-only; Mux acquires skip it (see the remote-ref codec docs).
     const ownerEnd = owner.openChannel();
     const requesterEnd = requester.openChannel();
     // Bridge first so no frame is dropped: owner calls/results and the requester
     // proxy's calls/results flow through the relay, both directions.
     ownerEnd.channel.onMessage((m) => requesterEnd.channel.send(m));
     requesterEnd.channel.onMessage((m) => ownerEnd.channel.send(m));
-    owner.send(ownerEnd.token);
-    owner.send(
-      {
-        type: "__serve-ref",
-        refId,
-        token: ownerEnd.token,
-        holderId: requesterId,
-      } satisfies Frame,
-    );
-    requester.send(requesterEnd.token);
-    requester.send(
-      {
-        type: "__ref-acquired",
-        refId,
-        token: requesterEnd.token,
-        ownerId,
-      } satisfies Frame,
-    );
+    if (owner.kind === "messageport") {
+      // Owner is a messageport transport: hand over the port by transfer.
+      const port = ownerEnd.token as MessagePort;
+      owner.send(
+        {
+          type: "__serve-ref",
+          refId,
+          port,
+          holderId: requesterId,
+        } satisfies Frame,
+        [port],
+      );
+    } else {
+      const token = ownerEnd.token;
+      owner.send(token);
+      owner.send(
+        {
+          type: "__serve-ref",
+          refId,
+          token,
+          holderId: requesterId,
+        } satisfies Frame,
+      );
+    }
+    if (requester.kind === "messageport") {
+      const port = requesterEnd.token as MessagePort;
+      requester.send(
+        {
+          type: "__ref-acquired",
+          refId,
+          port,
+          ownerId,
+        } satisfies Frame,
+        [port],
+      );
+    } else {
+      const token = requesterEnd.token;
+      requester.send(token);
+      requester.send(
+        {
+          type: "__ref-acquired",
+          refId,
+          token,
+          ownerId,
+        } satisfies Frame,
+      );
+    }
     return;
   }
   const { port1, port2 } = new MessageChannel();
