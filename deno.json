@@ -10,6 +10,7 @@
       "DESIGN.md",
       "OWNERSHIP.md",
       "PLUGIN-SYSTEM.md",
+      "TRANSPORT.md",
       "deno.lock",
       "examples/",
       "test_fixtures/",
