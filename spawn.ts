@@ -279,7 +279,7 @@ export function link(a: Worker, b: Worker, label: string): () => void {
   };
 }
 
-export async function spawn<
+export function spawn<
   T,
   const C extends readonly Codec<unknown>[] = readonly Codec<unknown>[],
 >(
@@ -580,13 +580,15 @@ export async function spawnProcess<
   );
   let dead = false;
   let disposed = false;
-  let actor: (Remote<T, CodecValueTypes<C>> & ActorHandle) | undefined;
+  // Assigned once spawn() resolves; kill() may run before that (no actor yet).
+  const actorRef: { current?: Remote<T, CodecValueTypes<C>> & ActorHandle } =
+    {};
   function kill(reason: unknown): void {
     if (dead) return;
     dead = true;
     options.onDeath?.(reason);
     // Tear down the inner actor so in-flight calls reject (not just the child).
-    if (actor) void actor.dispose();
+    if (actorRef.current) void actorRef.current.dispose();
     try {
       child.kill();
     } catch {
@@ -617,11 +619,12 @@ export async function spawnProcess<
   });
 
   // Build the actor on the IPC transport; onDeath wires process death to kill.
-  actor = await spawn<T, C>(transport, {
+  const actor = await spawn<T, C>(transport, {
     codecs: options.codecs,
     signal: options.signal,
     onDeath: (reason: unknown) => kill(reason),
   });
+  actorRef.current = actor;
   const innerDispose = actor.dispose.bind(actor);
   actor.dispose = (): Promise<void> => {
     disposed = true;
