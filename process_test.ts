@@ -78,6 +78,24 @@ Deno.test("spawnProcess: AbortSignal crosses processes and cancels work", async 
   }
 });
 
+Deno.test("spawnProcess: a pre-aborted signal still cancels remote work (status frame not lost)", async () => {
+  const actor = await spawnProcess<typeof ProcessWorker.rpc>(
+    "./test_fixtures/process_worker.ts",
+  );
+  try {
+    // The signal is already aborted before the call: the abort-signal codec
+    // sends its status frame immediately, which can race the placeholder
+    // decode on a Mux transport. The rebuilt signal must still be aborted.
+    const controller = new AbortController();
+    controller.abort("already");
+    const iterations = await actor.spin(5000, controller.signal);
+    // The child saw the pre-aborted state and returned quickly (0 iterations).
+    assertEquals(iterations, 0);
+  } finally {
+    await actor.dispose();
+  }
+});
+
 Deno.test("spawnProcess: callbacks cross processes and return results", async () => {
   const actor = await spawnProcess<typeof ProcessWorker.rpc>(
     "./test_fixtures/process_worker.ts",

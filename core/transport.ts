@@ -183,11 +183,16 @@ export function createMux(
   function makeChannel(ch: number): MuxChannel {
     let channelClosed = false;
     let msgHandler: ((message: unknown) => void) | undefined;
+    // Inbound data frames can arrive before the consumer attaches its handler
+    // (e.g. a codec posts a status frame right after openChannel, or the
+    // open/placeholder frames race). Buffer until onMessage is set.
+    const buffered: unknown[] = [];
     const channel: MuxChannel = {
       _ch: ch,
       get closed(): boolean {
         return channelClosed;
       },
+      kind: "framed",
       get port(): MessagePort {
         throw new Error("Mux channels have no MessagePort");
       },
@@ -197,15 +202,18 @@ export function createMux(
       },
       onMessage(h) {
         msgHandler = h;
+        while (buffered.length) h(buffered.shift()!);
       },
       close() {
         if (channelClosed) return;
         channelClosed = true;
         channels.delete(ch);
+        orphaned.delete(ch);
         write({ __mux: "close", ch } satisfies MuxFrame);
       },
       _deliver(value: unknown) {
-        msgHandler?.(value);
+        if (msgHandler) msgHandler(value);
+        else buffered.push(value);
       },
     };
     return channel;
@@ -236,7 +244,9 @@ export function createMux(
       return;
     }
     if (f.__mux === "close") {
-      const ch = channels.get(f.ch) ?? pending.get(f.ch);
+      // Look up pending (opener), channels (established), and orphaned
+      // (peer-opened, unclaimed) so a close racing the decode is not dropped.
+      const ch = channels.get(f.ch) ?? pending.get(f.ch) ?? orphaned.get(f.ch);
       if (ch) {
         channels.delete(f.ch);
         pending.delete(f.ch);
@@ -416,6 +426,9 @@ export function messageTransport(
   });
   const decode = options.decode ?? ((m: unknown) => m);
   let closed = false;
+  // Async decode (e.g. WebSocket Blob→bytes) can resolve out of order; chain
+  // every inbound message so Mux frames keep their arrival order.
+  let inboundChain: Promise<void> = Promise.resolve();
   return {
     get kind(): TransportKind {
       return "message";
@@ -437,12 +450,11 @@ export function messageTransport(
     },
     deliver(message) {
       if (closed) return;
-      const decoded = decode(message);
-      if (decoded instanceof Promise) {
-        void decoded.then((v) => mux.deliver(v), () => {});
-      } else {
+      // Chain async decodes so frames stay in arrival order.
+      inboundChain = inboundChain.then(async () => {
+        const decoded = await decode(message);
         mux.deliver(decoded);
-      }
+      }).catch(() => {});
     },
     close() {
       if (closed) return;

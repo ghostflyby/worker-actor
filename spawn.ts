@@ -17,7 +17,7 @@ import {
   PROTOCOL_VERSION,
 } from "./core/protocol.ts";
 import { type Codec, PayloadCodecRegistry } from "./core/codec.ts";
-import { createRpcProxy } from "./core/rpc.ts";
+import { createRpcProxy, type RpcProxy } from "./core/rpc.ts";
 import type { CodecValueTypes, TransformCallbacks } from "./core/type-utils.ts";
 import {
   type ControlFrame,
@@ -287,15 +287,28 @@ export async function spawn<
   options: SpawnOptions<C> = {},
 ): Promise<Remote<T, CodecValueTypes<C>> & ActorHandle> {
   // Worker is the structured-clone message-port world: convert it to a
-  // messageport-type Transport and recurse — every actor thereafter runs on
-  // the unified Transport abstraction (Worker / process IPC / WebSocket / TCP).
+  // messageport-type Transport and recurse on the unified abstraction. The raw
+  // Worker is kept alongside for crash detection and terminate() (the Transport
+  // abstraction has no worker error event or termination primitive).
   if (source instanceof Worker) {
-    return spawn<T, C>(
-      fromMessagePort(source as unknown as MessagePort),
+    const rawWorker = source;
+    return spawnOnTransport<T, C>(
+      fromMessagePort(rawWorker as unknown as MessagePort),
       options,
+      rawWorker,
     );
   }
-  const worker = source;
+  return spawnOnTransport<T, C>(source, options);
+}
+
+async function spawnOnTransport<
+  T,
+  const C extends readonly Codec<unknown>[] = readonly Codec<unknown>[],
+>(
+  worker: Transport,
+  options: SpawnOptions<C> = {},
+  rawWorker?: Worker,
+): Promise<Remote<T, CodecValueTypes<C>> & ActorHandle> {
   // Constraint: the worker handshake is not buffered — call spawn() right after
   // `new Worker(...)`. If messages arrive before the onmessage handler below is
   // set (e.g. another await in between), the handshake is lost and spawn()
@@ -395,17 +408,18 @@ export async function spawn<
     dispatchControlFrame(frame as ControlFrame);
   });
 
-  // Worker-only crash detection: the Transport abstraction has no error event;
-  // framed transports surface death through failAll / closed channels.
-  if (worker instanceof Worker) {
-    worker.onerror = (ev) =>
+  // Worker crash detection: only the raw Worker path has error events.
+  // Mux transports surface death through closed channels (wired via onDeath /
+  // onClose at the caller, e.g. spawnProcess).
+  if (rawWorker) {
+    rawWorker.onerror = (ev) =>
       kill(
         new Error(
           `Worker crashed: ${ev.message}`,
           { cause: ev.error },
         ),
       );
-    worker.onmessageerror = () =>
+    rawWorker.onmessageerror = () =>
       kill(new Error("Worker deserialization error"));
   }
 
@@ -417,7 +431,9 @@ export async function spawn<
     // If the handshake hasn't finished yet (version/codec mismatch, worker crash),
     // reject it so spawn() fails instead of hanging.
     rejectHandshake?.(reason);
-    worker.close();
+    // A real Worker is terminated; other transports are closed.
+    if (rawWorker) rawWorker.terminate();
+    else worker.close();
     // A dead worker can no longer serve references: drop it from acquire routing.
     workersById.delete(workerId);
     workerIdByWorker.delete(worker);
@@ -438,7 +454,8 @@ export async function spawn<
     try {
       worker.send({ type: "dispose" } satisfies Frame);
     } finally {
-      worker.close();
+      if (rawWorker) rawWorker.terminate();
+      else worker.close();
     }
     rpcProxy.rejectAll(new ActorDiedError());
     return Promise.resolve();
@@ -562,10 +579,14 @@ export async function spawnProcess<
     } as never,
   );
   let dead = false;
+  let disposed = false;
+  let actor: (Remote<T, CodecValueTypes<C>> & ActorHandle) | undefined;
   function kill(reason: unknown): void {
     if (dead) return;
     dead = true;
     options.onDeath?.(reason);
+    // Tear down the inner actor so in-flight calls reject (not just the child).
+    if (actor) void actor.dispose();
     try {
       child.kill();
     } catch {
@@ -582,22 +603,30 @@ export async function spawnProcess<
     },
     {
       onClosed: () => {
-        // The child's IPC channel closed (process exit / crash).
-        if (!dead) kill(new Error("Actor process exited unexpectedly"));
+        // The child's IPC channel closed (process exit / crash). A deliberate
+        // dispose already terminated the child — don't report it as a death.
+        if (!dead && !disposed) {
+          kill(new Error("Actor process exited unexpectedly"));
+        }
       },
     },
   );
   child.on("message", (message) => transport.deliver(message));
   child.on("error", (err) => {
-    if (!dead) kill(err);
+    if (!dead && !disposed) kill(err);
   });
 
   // Build the actor on the IPC transport; onDeath wires process death to kill.
-  const actor = await spawn<T, C>(transport, {
+  actor = await spawn<T, C>(transport, {
     codecs: options.codecs,
     signal: options.signal,
     onDeath: (reason: unknown) => kill(reason),
   });
+  const innerDispose = actor.dispose.bind(actor);
+  actor.dispose = (): Promise<void> => {
+    disposed = true;
+    return innerDispose();
+  };
   return actor;
 }
 
@@ -673,10 +702,14 @@ export async function spawnNode<
   );
 
   let dead = false;
+  let disposed = false;
+  const rpcProxies: RpcProxy[] = [];
   function kill(reason: unknown): void {
     if (dead) return;
     dead = true;
     options.onDeath?.(reason);
+    // Reject every actor channel's in-flight calls so callers don't hang.
+    for (const proxy of rpcProxies) proxy.rejectAll(reason);
     try {
       child.kill();
     } catch {
@@ -692,23 +725,35 @@ export async function spawnNode<
         return false;
       }
     },
-    { onClosed: () => !dead && kill(new Error("Node process exited")) },
+    {
+      onClosed: () => {
+        if (!dead && !disposed) kill(new Error("Node process exited"));
+      },
+    },
   );
   child.on("message", (message) => transport.deliver(message));
-  child.on("error", (err) => !dead && kill(err));
+  child.on("error", (err) => !dead && !disposed && kill(err));
 
-  // Handshake: the node announces its actor names.
+  // Handshake: the node announces its actor names. Failures kill the child.
   const actors = await new Promise<string[]>((resolve, reject) => {
-    const timeout = setTimeout(
-      () => reject(new Error("Node handshake timed out")),
-      10_000,
-    );
+    const timeout = setTimeout(() => {
+      kill(new Error("Node handshake timed out"));
+      reject(new Error("Node handshake timed out"));
+    }, 10_000);
     transport.onMessage((ev) => {
       const frame = ev.data as { type?: string; actors?: string[] };
       if (frame.type === "handshake") {
         clearTimeout(timeout);
         resolve(frame.actors ?? []);
       }
+    });
+    child.on("error", (err) => {
+      clearTimeout(timeout);
+      reject(err);
+    });
+    child.on("exit", () => {
+      clearTimeout(timeout);
+      reject(new Error("Node exited before handshake"));
     });
   });
 
@@ -747,6 +792,7 @@ export async function spawnNode<
       deadReason: () => new Error(`Actor "${name}" channel closed`),
       transport,
     });
+    rpcProxies.push(proxy);
     channel.onMessage((message) => {
       const frame = message as Frame;
       if (frame.type === "response") proxy.deliver(frame);
@@ -768,12 +814,19 @@ export async function spawnNode<
 
   const dispose = (): Promise<void> => {
     if (dead) return Promise.resolve();
+    disposed = true;
     dead = true;
     try {
       transport.send({ type: "dispose" } satisfies Frame);
     } finally {
       transport.close();
-      kill(new Error("Node disposed"));
+      // Deliberate shutdown: not a death — reject in-flight, don't fire onDeath.
+      for (const proxy of rpcProxies) proxy.rejectAll(new ActorDiedError());
+      try {
+        child.kill();
+      } catch {
+        // already exited
+      }
     }
     return Promise.resolve();
   };

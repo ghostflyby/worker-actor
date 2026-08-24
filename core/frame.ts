@@ -91,6 +91,7 @@ export function createEncoder(options: FrameOptions = {}): TransformStream<
         controller.error(e);
       }
     },
+    // End the readable when the writable closes so downstream pumps see done.
     flush(controller) {
       controller.terminate();
     },
