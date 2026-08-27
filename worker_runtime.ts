@@ -50,7 +50,7 @@ import { iterableCodec } from "./core/codecs/iterable.ts";
 import { errorCodec } from "./core/codecs/error.ts";
 import { abortSignalCodec } from "./core/codecs/abort_signal.ts";
 import { callbackCodec } from "./core/codecs/callback.ts";
-
+import type { TransferReturn } from "./core/transfer.ts";
 // Deno types `self` as Window by default; in a worker script it is actually a
 // DedicatedWorkerGlobalScope. Only the members used are declared here, so we
 // don't depend on lib.webworker.
@@ -115,6 +115,13 @@ export interface ServeWorkerOptions {
    */
   codecs?: Codec<unknown>[];
   /**
+   * Return-side transfer policy: which direct return values are moved instead
+   * of cloned. Only messageport transports support move; other transports
+   * ignore a move request and keep their normal clone behavior. Nested values
+   * are not inspected.
+   */
+  transferReturn?: TransferReturn;
+  /**
    * Called when the main thread links this worker to a peer via link().
    * The handle exposes value send/onValue and peer RPC (serve/rpc) over a
    * direct channel that bypasses the main thread; the peer must register a
@@ -154,7 +161,12 @@ function createRuntime(
   // Acquire control frames must ride this runtime's own transport (a process
   // actor has no self.postMessage for the __acquire-ref request).
   setActiveTransport(transport);
-  const mainHandler = makeRpcHandler(api, registry, transport);
+  const mainHandler = makeRpcHandler(
+    api,
+    registry,
+    transport,
+    options.transferReturn,
+  );
 
   transport.onMessage(async (ev) => {
     const frame = ev.data as Frame;
@@ -181,7 +193,12 @@ function createRuntime(
       let valueHandler: ((value: unknown) => void) | undefined;
       // Peer-callable surface: defaults to the main-thread api; serve() overrides.
       let linkApi: WorkerApi = api;
-      let linkHandler = makeRpcHandler(linkApi, registry);
+      let linkHandler = makeRpcHandler(
+        linkApi,
+        registry,
+        undefined,
+        options.transferReturn,
+      );
       // Calling side toward the peer (bidirectional RPC).
       const proxy = createRpcProxy(registry, {
         send: (request, transfer) =>
@@ -254,7 +271,12 @@ function createRuntime(
         },
         serve(newApi: WorkerApi): void {
           linkApi = newApi;
-          linkHandler = makeRpcHandler(linkApi, registry);
+          linkHandler = makeRpcHandler(
+            linkApi,
+            registry,
+            undefined,
+            options.transferReturn,
+          );
         },
         rpc: peerRpc,
         close(): void {
@@ -427,7 +449,12 @@ export function serveNode(
     }
     registry.registerChannel(channel);
     actorChannels.add(channel);
-    const handler = makeRpcHandler(rpcs[name], registry, transport);
+    const handler = makeRpcHandler(
+      rpcs[name],
+      registry,
+      transport,
+      options.transferReturn,
+    );
     channel.onMessage((message) => {
       const frame = message as Frame;
       if (frame.type === "request") {

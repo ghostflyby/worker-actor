@@ -50,3 +50,13 @@ export type {
 } from "./core/transport.ts";
 export { ActorDiedError, RemoteError } from "./core/protocol.ts";
 export type { RemoteCallback } from "./core/codecs/callback.ts";
+export type {
+  ArgPolicy,
+  ArgSlot,
+  ReturnPolicy,
+  TransferAction,
+  TransferArgs,
+  TransferArgsConfig,
+  TransferReturn,
+  TransferReturnConfig,
+} from "./core/transfer.ts";

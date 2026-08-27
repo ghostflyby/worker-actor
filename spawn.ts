@@ -19,6 +19,7 @@ import {
 import { type Codec, PayloadCodecRegistry } from "./core/codec.ts";
 import { createRpcProxy, type RpcProxy } from "./core/rpc.ts";
 import type { CodecValueTypes, TransformCallbacks } from "./core/type-utils.ts";
+import type { TransferArgs } from "./core/transfer.ts";
 import {
   type ControlFrame,
   dispatchControlFrame,
@@ -122,6 +123,17 @@ export interface SpawnOptions<
    * crash without breaking spawn.
    */
   onDeath?: (reason: unknown) => void;
+  /**
+   * Argument-side transfer policy: which parameters are moved (zero-copy,
+   * sender detaches) instead of cloned. Keyed by method name:
+   *   { upload: { "params[0]": "move" }, download: "move" }
+   *   { default: "move" }  // every parameter of every method
+   * Only top-level parameter positions are considered; a value must be
+   * transferable (ArrayBuffer / TypedArray / MessagePort). On non-messageport
+   * transports move is ignored and the transport's normal clone behavior is
+   * preserved.
+   */
+  transferArgs?: TransferArgs;
 }
 
 const HANDSHAKE_TIMEOUT = 10_000;
@@ -422,6 +434,7 @@ async function spawnOnTransport<
       ),
     isDead: () => dead,
     transport: worker,
+    transferArgs: options.transferArgs,
   });
   // Assign a stable transport id (embedded in refIds) and register it for
   // acquire routing. The id is sent after the handshake so the worker is
@@ -614,6 +627,8 @@ export interface SpawnProcessOptions<
   signal?: AbortSignal | null;
   /** Fired when the process actor dies (crash / handshake failure; not dispose). */
   onDeath?: (reason: unknown) => void;
+  /** Argument-side move policy for direct calls on the process transport. */
+  transferArgs?: TransferArgs;
   /**
    * Deno permissions granted to the child process (passed to Deno.Command's
    * `permissions` option). The caller controls exactly what the actor process
@@ -712,6 +727,7 @@ export async function spawnProcess<
     codecs: options.codecs,
     signal: options.signal,
     onDeath: (reason: unknown) => kill(reason),
+    transferArgs: options.transferArgs,
   });
   actorRef.current = actor;
   const innerDispose = actor.dispose.bind(actor);
@@ -752,6 +768,8 @@ export interface SpawnNodeOptions {
   signal?: AbortSignal | null;
   /** Fired when the node process dies (crash / handshake failure; not dispose). */
   onDeath?: (reason: unknown) => void;
+  /** Argument-side move policy for direct calls on node actor channels. */
+  transferArgs?: TransferArgs;
   /** Deno permissions granted to the child node process. */
   permissions?: Deno.PermissionOptionsObject;
   /** Extra CLI args for the child `deno run` invocation. */
@@ -906,6 +924,7 @@ export async function spawnNode<
       isDead: () => channel.closed,
       deadReason: () => new Error(`Actor "${name}" channel closed`),
       transport,
+      transferArgs: options.transferArgs,
     });
     rpcProxies.push(proxy);
     channel.onMessage((message) => {
