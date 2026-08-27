@@ -1,21 +1,22 @@
 /**
  * A composite codec: moves fetch Request/Response objects across actors by
- * delegating their BODY (a ReadableStream) to the built-in iterable machinery,
- * then rebuilding the object around the received stream.
+ * moving their BODY (a ReadableStream) through the native transfer list, then
+ * rebuilding the object around the received live stream.
  *
- * Why delegation instead of native support?
- *   Deno's structured clone cannot carry a bare ReadableStream over
- *   postMessage ("DataCloneError: Cannot clone object of unsupported type"),
- *   so there is nothing to piggyback on. But every stream IS an AsyncIterable,
- *   and the library's iterable codec already knows how to pump one across any
- *   transport (MessagePort pair or Mux token) with lazy start, backpressure,
- *   early-return cancellation and death cleanup. So this codec treats the body
- *   as just another payload value: ctx.registry.encode(body, ...) hands it to
- *   whatever codec claims it, and the placeholder nests inside ours.
+ * Deno streams are transfer-ONLY, not cloneable: postMessage without the
+ * transfer list rejects them ("DataCloneError"), while listing them moves
+ * ownership — the receiver gets a live stream at the payload position and the
+ * sender's copy is spent (bodyUsed flips to true, further reads throw).
+ * Verified on Deno 2.9.5 for MessageChannel and real Workers, nested at any
+ * payload depth.
  *
- * Move semantics: iterating request.body locks and drains the sender's stream,
- * so once the other side starts reading, the original object is spent — the
- * envelope (url/method/headers) is cloned metadata, the bytes are moved.
+ * Dual mode:
+ *   - messageport transports (the default worker link): ctx.transfer carries
+ *     the body; the wire holds it in place — zero plumbing, zero copies.
+ *   - Mux transports (fork IPC / WebSocket / framed): there is no transfer
+ *     list on those byte/message channels, so encode falls back to delegating
+ *     the body to the built-in iterable codec's channel pump via
+ *     ctx.registry.encode(...). Decode accepts both wire shapes.
  *
  * Byte-stream assumption: bodies are consumed as Uint8Array chunks (fetch spec
  * behavior); producers enqueueing raw strings will surface errors at read time.
@@ -39,7 +40,10 @@ interface HttpPlaceholder {
   statusText?: string;
   /** Shared wire fields. */
   headers: [string, string][];
-  /** Encoded iterable-codec placeholder, or null for bodiless values. */
+  /**
+   * messageport mode: the body stream itself (natively transferred in place).
+   * Mux mode: an iterable-codec placeholder. null for bodiless values.
+   */
   body: unknown;
 }
 
@@ -51,10 +55,16 @@ function encodeBody(
   value: Request | Response,
   ctx: EncodeContext,
 ): unknown {
-  if (value.body === null) return null;
-  // Delegate to the registry walk: the built-in iterable codec matches the
-  // stream (ReadableStream is an AsyncIterable) and owns the channel setup.
-  return ctx.registry.encode(value.body, ctx.transfer, ctx.transport);
+  const body = value.body;
+  if (!body) return null;
+  if (ctx.transport.kind === "messageport") {
+    // Native ownership transfer: keep the stream at its payload slot and list
+    // it for the transfer that this very message is sent with.
+    if (!ctx.transfer.includes(body)) ctx.transfer.push(body);
+    return body;
+  }
+  // No native transfer list over Mux: delegate to the iterable pump instead.
+  return ctx.registry.encode(body, ctx.transfer, ctx.transport);
 }
 
 function toByteStream(
@@ -91,6 +101,10 @@ function decodeBody(
   ctx: DecodeContext,
 ): ReadableStream<Uint8Array> | null {
   if (placeholder === null) return null;
+  // messageport mode: the wire already carries the live, natively transferred
+  // stream — nothing to rebuild.
+  if (placeholder instanceof ReadableStream) return placeholder;
+  // Mux mode: expand the iterable-codec placeholder, then adapt.
   const iterable = ctx.registry.decode(
     placeholder,
     ctx.transport,
