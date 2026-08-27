@@ -34,6 +34,7 @@ import type { Codec } from "./core/codec.ts";
 import type { Transport } from "./core/transport.ts";
 import { attachLazyIterator, spawn } from "./spawn.ts";
 import type { ActorHandle, Remote } from "./spawn.ts";
+import type { TransferArgs } from "./core/transfer.ts";
 import type { CodecValueTypes } from "./core/type-utils.ts";
 
 export interface ActorPoolOptions<
@@ -49,6 +50,8 @@ export interface ActorPoolOptions<
   codecs?: C;
   /** Creation interruption passed to every member's spawn. */
   signal?: AbortSignal | null;
+  /** Argument-side move policy passed to every member's spawn. */
+  transferArgs?: TransferArgs;
   /** Member selection strategy. Default "round-robin". */
   routing?:
     | "round-robin"
@@ -110,6 +113,7 @@ export function createActorPool<
     const ready = spawn<T, C>(options.spawnWorker(), {
       codecs: options.codecs,
       signal: options.signal,
+      transferArgs: options.transferArgs,
       onDeath: (reason) => {
         if (disposed || slot.dead) return;
         slot.dead = true;

@@ -20,6 +20,14 @@ import {
   serializeError,
 } from "./protocol.ts";
 import type { PayloadCodecRegistry } from "./codec.ts";
+import {
+  actionFor,
+  argPolicyFor,
+  collectMoveArgs,
+  collectMoveReturn,
+  type TransferArgs,
+  type TransferReturn,
+} from "./transfer.ts";
 import type { Transport } from "./transport.ts";
 
 // The RPC boundary is inherently dynamic; concrete method types are derived by
@@ -72,6 +80,7 @@ export function makeRpcHandler(
   api: RpcApi,
   registry: PayloadCodecRegistry,
   transport?: Transport,
+  transferReturn?: TransferReturn,
 ): (request: RpcRequest) => Promise<RpcResult> {
   return async (request) => {
     const fn = api[request.method];
@@ -88,6 +97,15 @@ export function makeRpcHandler(
       const args = registry.decode(request.args, transport) as unknown[];
       const value = await fn(...args);
       const transfer: Transferable[] = [];
+      // Return-side move: the worker encodes the return value; if a move
+      // policy names this method, keep the value in the payload and list it in
+      // the transfer list (sender detaches, receiver gets it in place).
+      collectMoveReturn(
+        value,
+        actionFor(transferReturn, request.method),
+        transfer,
+        transport,
+      );
       return {
         ok: true,
         id: request.id,
@@ -111,6 +129,8 @@ export interface RpcProxyOptions {
   deadReason?: () => Error;
   /** The transport this proxy encodes/decodes over (Mux-aware codec values). */
   transport?: Transport;
+  /** Argument-side move policy (spawn's transferArgs or a derived view's). */
+  transferArgs?: TransferArgs;
 }
 
 export interface RpcProxy {
@@ -139,20 +159,34 @@ export function createRpcProxy(
       if (options.isDead?.()) return Promise.reject(deadReason());
       return new Promise((resolve, reject) => {
         const id = nextId++;
-        pending.set(id, { resolve, reject });
         const transfer: Transferable[] = [];
-        options.send(
-          {
-            id,
-            method,
-            args: registry.encode(
-              args,
-              transfer,
-              options.transport,
-            ) as unknown[],
-          },
-          transfer,
-        );
+        try {
+          // Collect before publishing the pending call so an invalid move
+          // request rejects locally without leaving an unreachable entry.
+          collectMoveArgs(
+            args,
+            argPolicyFor(options.transferArgs, method),
+            transfer,
+            options.transport,
+          );
+          const encodedArgs = registry.encode(
+            args,
+            transfer,
+            options.transport,
+          ) as unknown[];
+          pending.set(id, { resolve, reject });
+          options.send(
+            {
+              id,
+              method,
+              args: encodedArgs,
+            },
+            transfer,
+          );
+        } catch (e) {
+          pending.delete(id);
+          reject(e);
+        }
       });
     },
     deliver(response): void {

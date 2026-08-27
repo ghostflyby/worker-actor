@@ -89,6 +89,25 @@ export type { ControlFrame } from "./core/worker-context.ts";
 export { serializeError } from "./core/protocol.ts";
 export type { SerializedError } from "./core/protocol.ts";
 
+export {
+  actionFor,
+  argPolicyFor,
+  collectMoveArgs,
+  collectMoveReturn,
+  isMovable,
+} from "./core/transfer.ts";
+export type {
+  ArgPolicy,
+  ArgSlot,
+  MovableValue,
+  ReturnPolicy,
+  TransferAction,
+  TransferArgs,
+  TransferArgsConfig,
+  TransferReturn,
+  TransferReturnConfig,
+} from "./core/transfer.ts";
+
 export type {
   CodecValueTypes,
   SyncOrAsync,
